@@ -107,12 +107,12 @@ class BluetoothManager:
 # ══════════════════════════════════════════════════════
 
 class PBAPFetcher:
-    """Fetch contacts from phone via Bluetooth PBAP (OBEX)"""
+    """Fetch contacts & call history from phone via Bluetooth PBAP"""
 
     def __init__(self, bt: BluetoothManager):
         self.bt = bt
-        self.contacts = []   # list of {"name": str, "phones": [str]}
-        self._session_path = None
+        self.contacts = []
+        self.call_history = []
 
     def _get_connected_addr(self):
         devs = self.bt.get_devices()
@@ -120,139 +120,174 @@ class PBAPFetcher:
         for addr, dev in devs.items():
             if dev["connected"] and any(pbap_uuid in u for u in dev["uuids"]):
                 return addr, dev["name"]
+        # fallback: any connected device
+        for addr, dev in devs.items():
+            if dev["connected"]:
+                return addr, dev["name"]
         return None, None
 
-    def fetch(self, progress_cb=None):
-        """Fetch all contacts. Returns list of contact dicts."""
+    def _create_session(self, addr):
+        sbus = dbus.SessionBus()
+        client = dbus.Interface(
+            sbus.get_object("org.bluez.obex", "/org/bluez/obex"),
+            "org.bluez.obex.Client1"
+        )
+        session_path = client.CreateSession(addr, {"Target": dbus.String("pbap")})
+        pbap = dbus.Interface(
+            sbus.get_object("org.bluez.obex", session_path),
+            "org.bluez.obex.PhonebookAccess1"
+        )
+        return sbus, client, session_path, pbap
+
+    def _pull_and_wait(self, sbus, pbap, dest_path):
+        """Pull phonebook and wait for completion by polling file size"""
+        import os
+        transfer_path, _ = pbap.PullAll(dest_path, dbus.Dictionary({}, signature='sv'))
+        # Poll until file stops growing (transfer complete)
+        prev_size = -1
+        stable_count = 0
+        for _ in range(120):
+            time.sleep(0.5)
+            try:
+                size = os.path.getsize(dest_path)
+                if size > 0 and size == prev_size:
+                    stable_count += 1
+                    if stable_count >= 3:
+                        break
+                else:
+                    stable_count = 0
+                prev_size = size
+            except:
+                pass
+        return dest_path
+
+    def fetch_contacts(self, progress_cb=None):
         addr, name = self._get_connected_addr()
         if not addr:
-            return [], "No PBAP-capable connected device found"
-
+            return [], "No connected device found"
         try:
-            bus = dbus.SessionBus()
-        except:
-            try:
-                bus = dbus.SystemBus()
-            except Exception as e:
-                return [], str(e)
-
-        try:
-            # Create OBEX session
-            client = dbus.Interface(
-                bus.get_object("org.bluez.obex", "/org/bluez/obex"),
-                "org.bluez.obex.Client1"
-            )
-            if progress_cb: progress_cb("Connecting to phonebook...")
-
-            session_path = client.CreateSession(addr, {"Target": dbus.String("pbap")})
-            self._session_path = session_path
-
-            pbap = dbus.Interface(
-                bus.get_object("org.bluez.obex", session_path),
-                "org.bluez.obex.PhonebookAccess1"
-            )
-
-            if progress_cb: progress_cb("Selecting phonebook...")
+            if progress_cb: GLib.idle_add(progress_cb, f"Connecting to {name}…")
+            sbus, client, session, pbap = self._create_session(addr)
             pbap.Select("int", "pb")
-
-            if progress_cb: progress_cb("Downloading contacts...")
-            # Pull all contacts as vCard
-            transfer_path, props = pbap.PullAll(
-                "/tmp/linuxphone_contacts.vcf",
-                {"Format": dbus.String("vcard30"),
-                 "Fields": dbus.Array(["VERSION","FN","TEL"], signature='s')}
-            )
-
-            # Wait for transfer
-            for _ in range(60):
-                time.sleep(0.5)
-                try:
-                    t_props = dbus.Interface(
-                        bus.get_object("org.bluez.obex", transfer_path),
-                        "org.freedesktop.DBus.Properties"
-                    ).GetAll("org.bluez.obex.Transfer1")
-                    status = str(t_props.get("Status", ""))
-                    if status == "complete":
-                        break
-                    elif status == "error":
-                        return [], "Transfer failed"
-                except: pass
-
-            # Parse vCard file
-            contacts = self._parse_vcf("/tmp/linuxphone_contacts.vcf")
+            count = int(pbap.GetSize())
+            if progress_cb: GLib.idle_add(progress_cb, f"Downloading {count} contacts…")
+            self._pull_and_wait(sbus, pbap, "/tmp/lp_contacts.vcf")
+            contacts = self._parse_vcf("/tmp/lp_contacts.vcf")
             self.contacts = contacts
-
-            # Cleanup session
-            try: client.RemoveSession(session_path)
+            try: client.RemoveSession(session)
             except: pass
-
-            return contacts, f"Loaded {len(contacts)} contacts from {name}"
-
-        except dbus.DBusException as e:
-            err = str(e)
-            if "obex" in err.lower() or "bluez" in err.lower():
-                # Fallback: use obexftp CLI
-                return self._fetch_via_cli(addr, progress_cb)
-            return [], f"DBus error: {err.split(':')[-1].strip()}"
+            return contacts, f"✅ Loaded {len(contacts)} contacts from {name}"
         except Exception as e:
-            return self._fetch_via_cli(addr, progress_cb)
+            return [], f"❌ Error: {str(e).split(':')[-1].strip()}"
 
-    def _fetch_via_cli(self, addr, progress_cb=None):
-        """Fallback: fetch via obexftp command line"""
-        if progress_cb: progress_cb("Trying obexftp fallback...")
+    def fetch_call_history(self, folder="cch", progress_cb=None):
+        """folder: cch=all, ich=incoming, och=outgoing, mch=missed"""
+        addr, name = self._get_connected_addr()
+        if not addr:
+            return [], "No connected device found"
         try:
-            result = subprocess.run(
-                ["obexftp", "--bluetooth", addr, "--channel", "19",
-                 "--get", "telecom/pb.vcf"],
-                capture_output=True, text=True, timeout=30
-            )
-            if result.returncode == 0 and result.stdout:
-                contacts = self._parse_vcf_string(result.stdout)
-                self.contacts = contacts
-                return contacts, f"Loaded {len(contacts)} contacts (CLI)"
-            return [], "obexftp failed. Try: sudo apt install obexftp"
-        except FileNotFoundError:
-            return [], "Install obexftp: sudo apt install obexftp"
+            if progress_cb: GLib.idle_add(progress_cb, "Fetching call history…")
+            sbus, client, session, pbap = self._create_session(addr)
+            pbap.Select("int", folder)
+            count = int(pbap.GetSize())
+            limit = min(count, 100)  # last 100 calls
+            if progress_cb: GLib.idle_add(progress_cb, f"Downloading {limit} call records…")
+            # Use List instead of PullAll for call history (faster)
+            entries = pbap.List(dbus.Dictionary({
+                "MaxListCount": dbus.UInt16(limit),
+                "ListStartOffset": dbus.UInt16(max(0, count - limit))
+            }, signature='sv'))
+            calls = []
+            for handle, name_str in entries:
+                calls.append({"handle": str(handle), "name": str(name_str)})
+            calls.reverse()
+            # Now pull the actual vCards for details
+            self._pull_and_wait(sbus, pbap, "/tmp/lp_calls.vcf")
+            detailed = self._parse_call_vcf("/tmp/lp_calls.vcf")
+            self.call_history = detailed
+            try: client.RemoveSession(session)
+            except: pass
+            return detailed, f"✅ Loaded {len(detailed)} recent calls"
         except Exception as e:
-            return [], str(e)
+            return [], f"❌ {str(e).split(':')[-1].strip()}"
 
     def _parse_vcf(self, filepath):
-        try:
-            with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
-                return self._parse_vcf_string(f.read())
-        except: return []
-
-    def _parse_vcf_string(self, data):
         contacts = []
         try:
+            with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+                data = f.read()
             for vcard in vobject.readComponents(data):
                 name = ""
                 phones = []
                 try:
-                    if hasattr(vcard, 'fn'):
-                        name = str(vcard.fn.value).strip()
+                    if hasattr(vcard, 'fn') and vcard.fn.value.strip():
+                        name = vcard.fn.value.strip()
                     elif hasattr(vcard, 'n'):
                         n = vcard.n.value
-                        name = f"{n.given} {n.family}".strip()
+                        parts = [n.given, n.family, n.additional]
+                        name = " ".join(p for p in parts if p).strip()
                 except: pass
-
                 try:
                     for tel in vcard.contents.get('tel', []):
-                        num = re.sub(r'[^\d+\-\s]', '', str(tel.value)).strip()
-                        if num: phones.append(num)
+                        num = re.sub(r'[^\d+\-\s\(\)]', '', str(tel.value)).strip()
+                        if num and num not in phones:
+                            phones.append(num)
                 except: pass
-
                 if name or phones:
                     contacts.append({
-                        "name": name or phones[0],
+                        "name": name or (phones[0] if phones else "Unknown"),
                         "phones": phones,
                         "initial": (name[0].upper() if name else "#")
                     })
         except Exception as e:
             pass
+        # Remove duplicates by name+phone, sort
+        seen = set()
+        unique = []
+        for c in contacts:
+            key = c["name"] + (c["phones"][0] if c["phones"] else "")
+            if key not in seen:
+                seen.add(key)
+                unique.append(c)
+        unique.sort(key=lambda c: c["name"].lower())
+        return unique
 
-        contacts.sort(key=lambda c: c["name"].lower())
-        return contacts
+    def _parse_call_vcf(self, filepath):
+        calls = []
+        try:
+            with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+                data = f.read()
+            for vcard in vobject.readComponents(data):
+                name = ""
+                number = ""
+                call_type = "unknown"
+                call_time = ""
+                try:
+                    if hasattr(vcard, 'fn'):
+                        name = vcard.fn.value.strip()
+                    for tel in vcard.contents.get('tel', []):
+                        number = re.sub(r'[^\d+\-\s]', '', str(tel.value)).strip()
+                        # Check X-IRMC-CALL-DATETIME
+                    for key, vals in vcard.contents.items():
+                        if 'call-datetime' in key.lower() or 'x-irmc' in key.lower():
+                            for v in vals:
+                                raw = str(v.value)
+                                # MISSED/RECEIVED/DIALED tag
+                                params = str(getattr(v, 'params', {}))
+                                if 'MISSED' in params.upper(): call_type = 'missed'
+                                elif 'RECEIVED' in params.upper(): call_type = 'incoming'
+                                elif 'DIALED' in params.upper(): call_type = 'outgoing'
+                                call_time = raw[:15] if raw else ""
+                except: pass
+                if number or name:
+                    calls.append({
+                        "name": name or number or "Unknown",
+                        "number": number,
+                        "type": call_type,
+                        "time": call_time
+                    })
+        except: pass
+        return calls
 
 
 # ══════════════════════════════════════════════════════
@@ -363,7 +398,7 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
         sidebar_box.append(self.nav_list)
 
         pages = [
-            ("call-start-symbolic",    "Contacts & Calls"),
+            ("call-start-symbolic",    "Contacts &amp; Calls"),
             ("audio-input-microphone-symbolic", "Dial Pad"),
             ("bluetooth-symbolic",     "Devices"),
         ]
@@ -462,13 +497,17 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
 
         return box
 
+    def _escape(self, text):
+        """Escape special XML/markup characters for GTK labels"""
+        return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
     def _make_contact_row(self, contact):
         row = Adw.ActionRow()
-        row.set_title(contact["name"] or "Unknown")
+        row.set_title(self._escape(contact["name"] or "Unknown"))
 
         phones = contact["phones"]
         if phones:
-            row.set_subtitle(phones[0])
+            row.set_subtitle(self._escape(phones[0]))
         row.set_activatable(True)
 
         # Avatar with initial
@@ -639,7 +678,7 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
 
         connected_names = []
         for addr, dev in devs.items():
-            row = Adw.ActionRow(title=dev["name"])
+            row = Adw.ActionRow(title=self._escape(dev["name"]))
             status = "🔗 Connected" if dev["connected"] else ("✅ Paired" if dev["paired"] else "🔵 Nearby")
             row.set_subtitle(f"{addr}  •  {status}")
 
@@ -693,7 +732,7 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
     def _fetch_contacts(self):
         self._toast("Connecting to phonebook…")
         def do():
-            contacts, msg = self.pbap.fetch(
+            contacts, msg = self.pbap.fetch_contacts(
                 progress_cb=lambda m: GLib.idle_add(self._toast, m)
             )
             GLib.idle_add(self._load_contacts_ui, contacts, msg)
