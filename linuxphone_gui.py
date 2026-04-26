@@ -398,9 +398,10 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
         sidebar_box.append(self.nav_list)
 
         pages = [
-            ("call-start-symbolic",    "Contacts &amp; Calls"),
-            ("audio-input-microphone-symbolic", "Dial Pad"),
-            ("bluetooth-symbolic",     "Devices"),
+            ("contact-new-symbolic",               "Contacts"),
+            ("call-start-symbolic",                "Recent Calls"),
+            ("audio-input-microphone-symbolic",    "Dial Pad"),
+            ("bluetooth-symbolic",                 "Devices"),
         ]
         for icon, label in pages:
             row = Adw.ActionRow(title=label)
@@ -423,6 +424,7 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
         content_page.set_child(self.stack)
 
         self.stack.add_named(self._build_contacts_page(), "contacts")
+        self.stack.add_named(self._build_calls_page(), "calls")
         self.stack.add_named(self._build_dialpad_page(), "dialpad")
         self.stack.add_named(self._build_devices_page(), "devices")
 
@@ -442,7 +444,7 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
         tb.set_vexpand(True)
 
         top_bar = Adw.HeaderBar(show_start_title_buttons=False, show_end_title_buttons=False)
-        top_bar.set_title_widget(Gtk.Label(label="Contacts & Calls", css_classes=["heading"]))
+        top_bar.set_title_widget(Gtk.Label(label="Contacts", css_classes=["heading"]))
         tb.add_top_bar(top_bar)
 
         # Sync button
@@ -537,6 +539,168 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
         row._contact = contact
         return row
 
+
+    # ── RECENT CALLS PAGE ─────────────────────────────
+
+    def _build_calls_page(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+
+        tb = Adw.ToolbarView()
+        box.append(tb)
+        tb.set_vexpand(True)
+
+        top_bar = Adw.HeaderBar(show_start_title_buttons=False, show_end_title_buttons=False)
+        top_bar.set_title_widget(Gtk.Label(label="Recent Calls", css_classes=["heading"]))
+        tb.add_top_bar(top_bar)
+
+        # Sync calls button
+        sync_btn = Gtk.Button(label="Sync Calls", icon_name="emblem-synchronizing-symbolic",
+                              css_classes=["suggested-action"], margin_end=6)
+        sync_btn.connect("clicked", lambda _: self._fetch_calls())
+        top_bar.pack_end(sync_btn)
+
+        # Filter tabs: All / Incoming / Outgoing / Missed
+        filter_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6,
+                             margin_start=12, margin_end=12, margin_top=8, margin_bottom=4,
+                             homogeneous=True)
+        self.call_filter_btns = {}
+        for key, label in [("all","All"), ("incoming","Incoming"), ("outgoing","Outgoing"), ("missed","Missed")]:
+            btn = Gtk.ToggleButton(label=label, css_classes=["flat"])
+            btn.connect("toggled", self._on_call_filter_toggled, key)
+            filter_box.append(btn)
+            self.call_filter_btns[key] = btn
+        self.call_filter_btns["all"].set_active(True)
+        self._active_call_filter = "all"
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        content.append(filter_box)
+        tb.set_content(content)
+
+        sw = Gtk.ScrolledWindow(vexpand=True)
+        content.append(sw)
+
+        self.calls_list = Gtk.ListBox(css_classes=["boxed-list"],
+                                      margin_start=12, margin_end=12,
+                                      margin_top=4, margin_bottom=12)
+        self.calls_list.set_filter_func(self._filter_call_row)
+        self.calls_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        sw.set_child(self.calls_list)
+
+        # Empty state
+        self.calls_empty = Adw.StatusPage(
+            title="No Call History",
+            description="Connect your phone and tap \"Sync Calls\"",
+            icon_name="call-start-symbolic",
+            vexpand=True
+        )
+        content.append(self.calls_empty)
+        self.calls_empty.set_visible(True)
+        self.calls_list.set_visible(False)
+
+        return box
+
+    def _on_call_filter_toggled(self, btn, key):
+        if not btn.get_active():
+            return
+        # Untoggle others
+        for k, b in self.call_filter_btns.items():
+            if k != key:
+                b.handler_block_by_func(self._on_call_filter_toggled)
+                b.set_active(False)
+                b.handler_unblock_by_func(self._on_call_filter_toggled)
+        self._active_call_filter = key
+        self.calls_list.invalidate_filter()
+
+    def _filter_call_row(self, row):
+        f = self._active_call_filter
+        if f == "all": return True
+        call = getattr(row, '_call', None)
+        if not call: return True
+        return call.get("type", "") == f
+
+    def _make_call_row(self, call):
+        row = Adw.ActionRow()
+        name = self._escape(call.get("name") or call.get("number") or "Unknown")
+        number = self._escape(call.get("number", ""))
+        row.set_title(name)
+
+        # Subtitle: type + time
+        ctype = call.get("type", "unknown")
+        ctime = call.get("time", "")
+        # Format time if available (YYYYMMDDTHHMMSS)
+        time_str = ""
+        if ctime and len(ctime) >= 8:
+            try:
+                dt = datetime.strptime(ctime[:15], "%Y%m%dT%H%M%S")
+                time_str = dt.strftime("%d %b, %I:%M %p")
+            except:
+                time_str = ctime[:15]
+        subtitle = time_str if time_str else number
+        row.set_subtitle(subtitle)
+
+        # Type icon prefix
+        if ctype == "incoming":
+            icon_name = "call-start-symbolic"
+            color_class = "success"
+            label_text = "↙ Incoming"
+        elif ctype == "outgoing":
+            icon_name = "call-start-symbolic"
+            color_class = "accent"
+            label_text = "↗ Outgoing"
+        elif ctype == "missed":
+            icon_name = "call-missed-symbolic"
+            color_class = "error"
+            label_text = "✗ Missed"
+        else:
+            icon_name = "call-start-symbolic"
+            color_class = "dim-label"
+            label_text = "Call"
+
+        type_label = Gtk.Label(label=label_text,
+                               css_classes=["caption", color_class],
+                               xalign=0)
+        icon = Gtk.Image(icon_name=icon_name, css_classes=[color_class])
+        prefix_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
+                             valign=Gtk.Align.CENTER, spacing=2)
+        prefix_box.append(icon)
+        row.add_prefix(prefix_box)
+
+        # Call back button
+        num = call.get("number", "")
+        if num:
+            cb_btn = Gtk.Button(icon_name="call-start-symbolic",
+                                css_classes=["flat", "circular"],
+                                tooltip_text=f"Call back {num}",
+                                valign=Gtk.Align.CENTER)
+            cb_btn.connect("clicked", lambda _, n=num: self._make_call(n))
+            row.add_suffix(cb_btn)
+
+        row._call = call
+        return row
+
+    def _fetch_calls(self):
+        self._toast("Fetching call history…")
+        def do():
+            calls, msg = self.pbap.fetch_call_history(progress_cb=lambda m: GLib.idle_add(self._toast, m))
+            GLib.idle_add(self._load_calls_ui, calls, msg)
+        threading.Thread(target=do, daemon=True).start()
+
+    def _load_calls_ui(self, calls, msg):
+        while True:
+            child = self.calls_list.get_first_child()
+            if child is None: break
+            self.calls_list.remove(child)
+
+        if calls:
+            for c in calls:
+                row = self._make_call_row(c)
+                self.calls_list.append(row)
+            self.calls_list.set_visible(True)
+            self.calls_empty.set_visible(False)
+        else:
+            self.calls_list.set_visible(False)
+            self.calls_empty.set_visible(True)
+        self._toast(msg)
 
     # ── DIAL PAD PAGE ─────────────────────────────────
 
@@ -647,8 +811,8 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
     def _on_nav_selected(self, listbox, row):
         if row is None: return
         idx = row.get_index()
-        pages = ["contacts", "dialpad", "devices"]
-        titles = ["Contacts & Calls", "Dial Pad", "Devices"]
+        pages = ["contacts", "calls", "dialpad", "devices"]
+        titles = ["Contacts", "Recent Calls", "Dial Pad", "Devices"]
         if idx < len(pages):
             self.stack.set_visible_child_name(pages[idx])
             self.content_page.set_title(titles[idx])
@@ -740,23 +904,45 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
 
     def _load_contacts_ui(self, contacts, msg):
         self.all_contacts = contacts
+        self._contacts_loaded = 0
+
         # Clear old rows
         while True:
             child = self.contacts_list.get_first_child()
             if child is None: break
             self.contacts_list.remove(child)
 
-        if contacts:
-            for c in contacts:
-                row = self._make_contact_row(c)
-                self.contacts_list.append(row)
-            self.contacts_list.set_visible(True)
-            self.contacts_empty.set_visible(False)
-        else:
+        if not contacts:
             self.contacts_list.set_visible(False)
             self.contacts_empty.set_visible(True)
+            self._toast(msg)
+            return
 
+        self.contacts_list.set_visible(True)
+        self.contacts_empty.set_visible(False)
         self._toast(msg)
+
+        # Load first batch immediately, rest via idle
+        self._append_contact_batch()
+
+    def _append_contact_batch(self):
+        """Append up to 15 contacts at a time — called via GLib.idle_add so UI stays responsive"""
+        BATCH = 15
+        contacts = self.all_contacts
+        start = self._contacts_loaded
+        end = min(start + BATCH, len(contacts))
+
+        for c in contacts[start:end]:
+            row = self._make_contact_row(c)
+            self.contacts_list.append(row)
+
+        self._contacts_loaded = end
+
+        # If more remain, schedule next batch (idle priority = after UI events)
+        if end < len(contacts):
+            GLib.idle_add(self._append_contact_batch)
+            return False  # don't repeat via timeout
+        return False
 
     def _on_search(self, entry):
         self.contacts_list.invalidate_filter()
