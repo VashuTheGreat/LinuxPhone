@@ -72,25 +72,33 @@ else
     echo -e "${GREEN}✓ All system dependencies present${NC}"
 fi
 
-# ── Step 3: Check BlueZ / obexd ────────────────────────────────
+# ── Step 3: Check BlueZ, obexd, oFono (optional) ──────────────
 echo -e "${YELLOW}[3/5] Checking Bluetooth services...${NC}"
 
-WARN=0
+# BlueZ — zaruri hai
 if ! command -v bluetoothctl &>/dev/null; then
-    echo -e "${YELLOW}  ⚠ bluetoothctl not found — install bluez:${NC}"
+    echo -e "${YELLOW}  ⚠ bluez not found — install bluez:${NC}"
     echo "    sudo apt install bluez"
-    WARN=1
+else
+    echo -e "${GREEN}  ✓ bluez OK${NC}"
 fi
 
-if ! systemctl --user status obex &>/dev/null 2>&1 && \
-   ! systemctl status bluetooth &>/dev/null 2>&1; then
-    echo -e "${YELLOW}  ⚠ Bluetooth service may not be running.${NC}"
-    echo "    Start it with: sudo systemctl start bluetooth"
-    WARN=1
+# bluetooth service running?
+if systemctl is-active --quiet bluetooth 2>/dev/null; then
+    echo -e "${GREEN}  ✓ bluetooth service running${NC}"
+else
+    echo -e "${YELLOW}  ⚠ bluetooth service not running${NC}"
+    echo "    Start with: sudo systemctl start bluetooth"
 fi
 
-if [ $WARN -eq 0 ]; then
-    echo -e "${GREEN}✓ Bluetooth services OK${NC}"
+# oFono — optional, sirf calling ke liye chahiye
+if command -v ofonod &>/dev/null || systemctl is-active --quiet ofono 2>/dev/null; then
+    echo -e "${GREEN}  ✓ oFono found (calling supported)${NC}"
+else
+    echo -e "${YELLOW}  ⚠ oFono not found — installing...${NC}"
+    sudo apt-get install -y ofono && \
+        echo -e "${GREEN}  ✓ oFono installed (calling supported)${NC}" || \
+        echo -e "${YELLOW}  ⚠ oFono install failed — calling won't work, contacts will still sync${NC}"
 fi
 
 # ── Step 4: Install app files ──────────────────────────────────
