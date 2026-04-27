@@ -432,7 +432,7 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="LinuxPhone")
         self.set_default_size(900, 650)
-        self.set_size_request(700, 500)
+        self.set_default_size(900, 650)
 
         self.bt = BluetoothManager()
         self.pbap = PBAPFetcher(self.bt)
