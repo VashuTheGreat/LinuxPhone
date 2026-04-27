@@ -1071,12 +1071,9 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
         ok, msg = self.calls.call(number)
         self._toast(msg)
         if ok:
-            self.call_banner.set_title(f"📞 Calling {number}…")
-            self.call_banner.set_revealed(True)
-            self.call_btn.set_visible(False)
-            self.end_btn.set_visible(True)
-            self.call_status_label.set_text(msg)
-            self._start_call_timer()
+            contact_name = self._lookup_contact_name(number)
+            display_name = contact_name if contact_name else number
+            self._show_in_call_dialog(display_name, number, outgoing=True)
 
     def _end_call(self):
         ok, msg = self.calls.hangup()
@@ -1088,17 +1085,112 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
         if self._call_timer_id:
             GLib.source_remove(self._call_timer_id)
             self._call_timer_id = None
+        # Close in-call dialog if open
+        if hasattr(self, '_incall_dialog') and self._incall_dialog:
+            try: self._incall_dialog.close()
+            except: pass
+            self._incall_dialog = None
+
+    def _show_in_call_dialog(self, display_name, number, outgoing=True):
+        """Show a persistent in-call popup with timer and hangup button"""
+        # Close any existing one
+        if hasattr(self, '_incall_dialog') and self._incall_dialog:
+            try: self._incall_dialog.close()
+            except: pass
+
+        dialog = Adw.Dialog()
+        dialog.set_title("In Call")
+        dialog.set_content_width(320)
+        dialog.set_content_height(300)
+        dialog.set_follows_content_size(False)
+        self._incall_dialog = dialog
+
+        toolbar = Adw.ToolbarView()
+        hdr = Adw.HeaderBar(show_end_title_buttons=False, show_start_title_buttons=False)
+        hdr.set_title_widget(Adw.WindowTitle(
+            title="In Call",
+            subtitle="via Bluetooth HFP"
+        ))
+        toolbar.add_top_bar(hdr)
+        dialog.set_child(toolbar)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16,
+                      halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER,
+                      vexpand=True,
+                      margin_top=16, margin_bottom=28,
+                      margin_start=24, margin_end=24)
+        toolbar.set_content(box)
+
+        # Avatar
+        avatar = Adw.Avatar(size=80, text=display_name, show_initials=True)
+        box.append(avatar)
+
+        # Name
+        name_lbl = Gtk.Label(label=self._escape(display_name),
+                             css_classes=["title-2"],
+                             wrap=True, justify=Gtk.Justification.CENTER)
+        box.append(name_lbl)
+
+        # Show number under name if name was resolved
+        if display_name != number:
+            num_lbl = Gtk.Label(label=self._escape(number),
+                                css_classes=["dim-label"],
+                                justify=Gtk.Justification.CENTER)
+            box.append(num_lbl)
+
+        # Status / timer label
+        status_lbl = Gtk.Label(
+            label="📞 Calling…" if outgoing else "📞 Connected",
+            css_classes=["caption", "dim-label"]
+        )
+        box.append(status_lbl)
+
+        # Timer label (big)
+        timer_lbl = Gtk.Label(label="00:00", css_classes=["title-1"])
+        timer_lbl.set_visible(not outgoing)  # hide timer until connected
+        box.append(timer_lbl)
+
+        # Hangup button
+        end_btn = Gtk.Button(icon_name="call-stop-symbolic",
+                             css_classes=["circular", "destructive-action"],
+                             width_request=80, height_request=80)
+        end_lbl = Gtk.Label(label="End Call", css_classes=["caption"])
+        end_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+                          halign=Gtk.Align.CENTER)
+        end_box.append(end_btn)
+        end_box.append(end_lbl)
+        box.append(end_box)
+
+        call_start = datetime.now()
+
+        def tick():
+            if not (hasattr(self, '_incall_dialog') and self._incall_dialog):
+                return False
+            elapsed = int((datetime.now() - call_start).total_seconds())
+            m, s = divmod(elapsed, 60)
+            timer_lbl.set_text(f"{m:02d}:{s:02d}")
+            timer_lbl.set_visible(True)
+            status_lbl.set_text("📞 Connected")
+            return True
+
+        timer_id = GLib.timeout_add(1000, tick)
+
+        def on_hangup(_):
+            GLib.source_remove(timer_id)
+            self._end_call()
+
+        def on_closed(_):
+            self._incall_dialog = None
+            try: GLib.source_remove(timer_id)
+            except: pass
+
+        end_btn.connect("clicked", on_hangup)
+        dialog.connect("closed", on_closed)
+        dialog.present(self)
 
     def _start_call_timer(self):
-        def tick():
-            if self.calls.active_call:
-                dur = int((datetime.now() - self.calls.active_call["start"]).total_seconds())
-                m, s = divmod(dur, 60)
-                self.call_status_label.set_text(f"Call duration: {m:02d}:{s:02d}")
-                self.call_banner.set_title(f"📞 {self.calls.active_call['number']}  {m:02d}:{s:02d}")
-                return True
-            return False
-        self._call_timer_id = GLib.timeout_add(1000, tick)
+        # Legacy — kept for compatibility, real timer now lives in _show_in_call_dialog
+        pass
 
     def _dial_key(self, key):
         cur = self.dial_entry.get_text()
@@ -1222,15 +1314,10 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
         def on_answer(_):
             ok, msg = self.calls.answer(self._incoming_call_path)
             self._toast(msg)
-            if ok:
-                self.call_banner.set_title(f"📞 {display_name}")
-                self.call_banner.set_revealed(True)
-                self.call_btn.set_visible(False)
-                self.end_btn.set_visible(True)
-                self.call_status_label.set_text(msg)
-                self._start_call_timer()
             dialog.close()
             self._incoming_dialog = None
+            if ok:
+                self._show_in_call_dialog(display_name, number, outgoing=False)
 
         def on_reject(_):
             ok, msg = self.calls.reject(self._incoming_call_path)
