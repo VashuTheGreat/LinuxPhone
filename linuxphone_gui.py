@@ -1124,12 +1124,20 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
     # ── INCOMING CALL POPUP ───────────────────────────
 
     def _lookup_contact_name(self, number):
-        """Return contact name for a number, or None if not found"""
-        clean = re.sub(r'[^\d+]', '', number)
+        """Return contact name for a number using last-10-digit matching"""
+        clean = re.sub(r'[^\d]', '', number)  # only digits
+        if not clean:
+            return None
+        suffix = clean[-10:]  # last 10 digits for comparison
         for c in getattr(self, 'all_contacts', []):
+            # Skip contacts whose name looks like a number
+            name = c.get('name', '')
+            if not name or re.fullmatch(r'[\d\s\+\-\.\(\)]+', name):
+                continue
             for p in c.get('phones', []):
-                if re.sub(r'[^\d+]', '', p) == clean:
-                    return c['name']
+                p_digits = re.sub(r'[^\d]', '', p)
+                if p_digits and p_digits[-10:] == suffix:
+                    return name
         return None
 
     def _show_incoming_call_popup(self, number, call_path):
