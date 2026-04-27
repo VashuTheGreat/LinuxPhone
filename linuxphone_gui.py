@@ -330,6 +330,60 @@ class CallManager:
         self.active_call = None
         self.call_log = []
         self._bus = dbus.SystemBus()
+        self._incoming_cb = None   # set by window to show incoming call popup
+        self._watch_calls()
+
+    def set_incoming_callback(self, cb):
+        """cb(number, call_path) called when an incoming call arrives"""
+        self._incoming_cb = cb
+
+    def _watch_calls(self):
+        """Subscribe to oFono VoiceCallManager.CallAdded signal on system bus"""
+        try:
+            self._bus.add_signal_receiver(
+                self._on_call_added,
+                signal_name="CallAdded",
+                dbus_interface="org.ofono.VoiceCallManager",
+                bus_name="org.ofono",
+                path_keyword="sender_path"
+            )
+        except Exception as e:
+            print(f"[CallManager] Could not subscribe to CallAdded: {e}")
+
+    def _on_call_added(self, call_path, props, sender_path=None):
+        """Fires when oFono announces a new call (incoming or outgoing)"""
+        state = str(props.get("State", ""))
+        line_id = str(props.get("LineIdentification", "Unknown"))
+        name = str(props.get("Name", ""))
+        display = name if name else line_id
+        if state == "incoming" and self._incoming_cb:
+            GLib.idle_add(self._incoming_cb, display, str(call_path))
+
+    def answer(self, call_path):
+        """Answer an incoming call by its oFono object path"""
+        try:
+            call_iface = dbus.Interface(
+                self._bus.get_object("org.ofono", call_path),
+                "org.ofono.VoiceCall"
+            )
+            call_iface.Answer()
+            self.active_call = {"number": call_path, "name": call_path,
+                                "start": datetime.now(), "path": call_path}
+            return True, "Call answered"
+        except dbus.DBusException as e:
+            return False, str(e).split(": ")[-1]
+
+    def reject(self, call_path):
+        """Reject / hang up a specific incoming call"""
+        try:
+            call_iface = dbus.Interface(
+                self._bus.get_object("org.ofono", call_path),
+                "org.ofono.VoiceCall"
+            )
+            call_iface.Hangup()
+            return True, "Call rejected"
+        except dbus.DBusException as e:
+            return False, str(e).split(": ")[-1]
 
     def _get_modem(self):
         try:
@@ -390,6 +444,8 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
         GLib.timeout_add(15000, self._auto_refresh_devices)
         # Load from cache on startup — no Bluetooth needed
         GLib.idle_add(self._load_from_cache)
+        # Hook incoming call popup
+        self.calls.set_incoming_callback(self._show_incoming_call_popup)
 
     # ── UI BUILD ──────────────────────────────────────
 
@@ -1064,6 +1120,122 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
             self.toast_overlay.add_toast(toast)
         except: pass
         self.status_label.set_text(str(msg)[:80])
+
+    # ── INCOMING CALL POPUP ───────────────────────────
+
+    def _lookup_contact_name(self, number):
+        """Return contact name for a number, or None if not found"""
+        clean = re.sub(r'[^\d+]', '', number)
+        for c in getattr(self, 'all_contacts', []):
+            for p in c.get('phones', []):
+                if re.sub(r'[^\d+]', '', p) == clean:
+                    return c['name']
+        return None
+
+    def _show_incoming_call_popup(self, number, call_path):
+        """Show a full-screen-style incoming call dialog with Answer/Reject"""
+        # Prevent duplicate popups
+        if hasattr(self, '_incoming_dialog') and self._incoming_dialog:
+            try: self._incoming_dialog.close()
+            except: pass
+
+        dialog = Adw.Dialog()
+        dialog.set_title("Incoming Call")
+        dialog.set_content_width(340)
+        dialog.set_content_height(260)
+        self._incoming_dialog = dialog
+        self._incoming_call_path = call_path
+
+        # Resolve name from contacts if available
+        contact_name = self._lookup_contact_name(number)
+        display_name = contact_name if contact_name else number
+        toolbar = Adw.ToolbarView()
+        hdr = Adw.HeaderBar(show_end_title_buttons=False, show_start_title_buttons=False)
+        hdr.set_title_widget(Adw.WindowTitle(title="Incoming Call", subtitle="via Bluetooth HFP"))
+        toolbar.add_top_bar(hdr)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20,
+                      halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER,
+                      vexpand=True, margin_top=16, margin_bottom=24,
+                      margin_start=24, margin_end=24)
+        toolbar.set_content(box)
+        dialog.set_child(toolbar)
+
+        # Avatar / icon
+        avatar = Adw.Avatar(size=72, text=display_name, show_initials=True)
+        box.append(avatar)
+
+        # Number / name label
+        num_label = Gtk.Label(label=self._escape(display_name),
+                              css_classes=["title-2"],
+                              wrap=True, justify=Gtk.Justification.CENTER)
+        box.append(num_label)
+
+        # Show number as subtitle if name was resolved
+        if contact_name:
+            sub_label = Gtk.Label(label=self._escape(number),
+                                  css_classes=["dim-label"],
+                                  wrap=True, justify=Gtk.Justification.CENTER)
+            box.append(sub_label)
+
+        # Pulsing status label
+        status_lbl = Gtk.Label(label="📞 Ringing…",
+                               css_classes=["dim-label"])
+        box.append(status_lbl)
+
+        # Buttons row
+        btn_row = Gtk.Box(spacing=32, halign=Gtk.Align.CENTER)
+        box.append(btn_row)
+
+        # Reject (red)
+        reject_btn = Gtk.Button(icon_name="call-stop-symbolic",
+                                css_classes=["circular", "destructive-action"],
+                                width_request=72, height_request=72,
+                                tooltip_text="Reject")
+        reject_lbl = Gtk.Label(label="Reject")
+        reject_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4,
+                             halign=Gtk.Align.CENTER)
+        reject_box.append(reject_btn)
+        reject_box.append(reject_lbl)
+        btn_row.append(reject_box)
+
+        # Answer (green)
+        answer_btn = Gtk.Button(icon_name="call-start-symbolic",
+                                css_classes=["circular", "suggested-action"],
+                                width_request=72, height_request=72,
+                                tooltip_text="Answer")
+        answer_lbl = Gtk.Label(label="Answer")
+        answer_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4,
+                             halign=Gtk.Align.CENTER)
+        answer_box.append(answer_btn)
+        answer_box.append(answer_lbl)
+        btn_row.append(answer_box)
+
+        def on_answer(_):
+            ok, msg = self.calls.answer(self._incoming_call_path)
+            self._toast(msg)
+            if ok:
+                self.call_banner.set_title(f"📞 {display_name}")
+                self.call_banner.set_revealed(True)
+                self.call_btn.set_visible(False)
+                self.end_btn.set_visible(True)
+                self.call_status_label.set_text(msg)
+                self._start_call_timer()
+            dialog.close()
+            self._incoming_dialog = None
+
+        def on_reject(_):
+            ok, msg = self.calls.reject(self._incoming_call_path)
+            self._toast(msg)
+            dialog.close()
+            self._incoming_dialog = None
+
+        answer_btn.connect("clicked", on_answer)
+        reject_btn.connect("clicked", on_reject)
+        dialog.connect("closed", lambda _: setattr(self, '_incoming_dialog', None))
+
+        dialog.present(self)
+        return False  # GLib.idle_add return
 
 
 # ══════════════════════════════════════════════════════
