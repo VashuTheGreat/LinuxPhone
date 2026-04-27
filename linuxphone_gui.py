@@ -11,8 +11,13 @@ gi.require_version('Adw', '1')
 
 from gi.repository import Gtk, Adw, GLib, Gdk, Gio, GObject, Pango
 import dbus, dbus.mainloop.glib
-import threading, subprocess, time, vobject, io, re
+import threading, subprocess, time, vobject, io, re, json, os
 from datetime import datetime
+
+CACHE_DIR = os.path.expanduser("~/.cache/linuxphone")
+os.makedirs(CACHE_DIR, exist_ok=True)
+CONTACTS_CACHE = os.path.join(CACHE_DIR, "contacts.json")
+CALLS_CACHE    = os.path.join(CACHE_DIR, "calls.json")
 
 dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
 
@@ -164,51 +169,77 @@ class PBAPFetcher:
     def fetch_contacts(self, progress_cb=None):
         addr, name = self._get_connected_addr()
         if not addr:
+            # Try loading from cache
+            if os.path.exists(CONTACTS_CACHE):
+                try:
+                    with open(CONTACTS_CACHE) as f:
+                        contacts = json.load(f)
+                    return contacts, f"📦 Loaded {len(contacts)} contacts from cache (phone not connected)"
+                except: pass
             return [], "No connected device found"
         try:
-            if progress_cb: GLib.idle_add(progress_cb, f"Connecting to {name}…")
+            if progress_cb: progress_cb(f"Connecting to {name}…")
             sbus, client, session, pbap = self._create_session(addr)
             pbap.Select("int", "pb")
             count = int(pbap.GetSize())
-            if progress_cb: GLib.idle_add(progress_cb, f"Downloading {count} contacts…")
+            if progress_cb: progress_cb(f"Downloading {count} contacts…")
             self._pull_and_wait(sbus, pbap, "/tmp/lp_contacts.vcf")
+            if progress_cb: progress_cb("Parsing contacts…")
             contacts = self._parse_vcf("/tmp/lp_contacts.vcf")
             self.contacts = contacts
+            # Save to JSON cache
+            try:
+                with open(CONTACTS_CACHE, 'w') as f:
+                    json.dump(contacts, f, ensure_ascii=False)
+            except: pass
             try: client.RemoveSession(session)
             except: pass
             return contacts, f"✅ Loaded {len(contacts)} contacts from {name}"
         except Exception as e:
+            # Fallback to cache
+            if os.path.exists(CONTACTS_CACHE):
+                try:
+                    with open(CONTACTS_CACHE) as f:
+                        contacts = json.load(f)
+                    return contacts, f"⚠ Error syncing, showing cached data ({len(contacts)} contacts)"
+                except: pass
             return [], f"❌ Error: {str(e).split(':')[-1].strip()}"
 
     def fetch_call_history(self, folder="cch", progress_cb=None):
-        """folder: cch=all, ich=incoming, och=outgoing, mch=missed"""
         addr, name = self._get_connected_addr()
         if not addr:
+            if os.path.exists(CALLS_CACHE):
+                try:
+                    with open(CALLS_CACHE) as f:
+                        calls = json.load(f)
+                    return calls, f"📦 Loaded {len(calls)} calls from cache (phone not connected)"
+                except: pass
             return [], "No connected device found"
         try:
-            if progress_cb: GLib.idle_add(progress_cb, "Fetching call history…")
+            if progress_cb: progress_cb("Fetching call history…")
             sbus, client, session, pbap = self._create_session(addr)
             pbap.Select("int", folder)
             count = int(pbap.GetSize())
-            limit = min(count, 100)  # last 100 calls
-            if progress_cb: GLib.idle_add(progress_cb, f"Downloading {limit} call records…")
-            # Use List instead of PullAll for call history (faster)
-            entries = pbap.List(dbus.Dictionary({
-                "MaxListCount": dbus.UInt16(limit),
-                "ListStartOffset": dbus.UInt16(max(0, count - limit))
-            }, signature='sv'))
-            calls = []
-            for handle, name_str in entries:
-                calls.append({"handle": str(handle), "name": str(name_str)})
-            calls.reverse()
-            # Now pull the actual vCards for details
+            limit = min(count, 100)
+            if progress_cb: progress_cb(f"Downloading {limit} call records…")
             self._pull_and_wait(sbus, pbap, "/tmp/lp_calls.vcf")
+            if progress_cb: progress_cb("Parsing call history…")
             detailed = self._parse_call_vcf("/tmp/lp_calls.vcf")
             self.call_history = detailed
+            try:
+                with open(CALLS_CACHE, 'w') as f:
+                    json.dump(detailed, f, ensure_ascii=False)
+            except: pass
             try: client.RemoveSession(session)
             except: pass
             return detailed, f"✅ Loaded {len(detailed)} recent calls"
         except Exception as e:
+            if os.path.exists(CALLS_CACHE):
+                try:
+                    with open(CALLS_CACHE) as f:
+                        calls = json.load(f)
+                    return calls, f"⚠ Error syncing, showing cached data ({len(calls)} calls)"
+                except: pass
             return [], f"❌ {str(e).split(':')[-1].strip()}"
 
     def _parse_vcf(self, filepath):
@@ -356,7 +387,9 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
         self._call_timer_id = None
 
         self._build_ui()
-        GLib.timeout_add(3000, self._auto_refresh_devices)
+        GLib.timeout_add(15000, self._auto_refresh_devices)
+        # Load from cache on startup — no Bluetooth needed
+        GLib.idle_add(self._load_from_cache)
 
     # ── UI BUILD ──────────────────────────────────────
 
@@ -453,49 +486,43 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
         sync_btn.connect("clicked", lambda _: self._fetch_contacts())
         top_bar.pack_end(sync_btn)
 
-        # Content
-        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        tb.set_content(content)
-
-        # Search bar
+        # Widgets (not yet parented)
         self.search_entry = Gtk.SearchEntry(placeholder_text="Search contacts…",
                                             margin_start=12, margin_end=12,
                                             margin_top=8, margin_bottom=8)
         self.search_entry.connect("search-changed", self._on_search)
-        content.append(self.search_entry)
-
-        # Contacts list in scrolled window
-        sw = Gtk.ScrolledWindow(vexpand=True)
-        content.append(sw)
 
         self.contacts_list = Gtk.ListBox(css_classes=["boxed-list"],
                                          margin_start=12, margin_end=12, margin_bottom=12)
         self.contacts_list.set_filter_func(self._filter_contact)
         self.contacts_list.set_selection_mode(Gtk.SelectionMode.NONE)
-        sw.set_child(self.contacts_list)
 
-        # Empty state
         self.contacts_empty = Adw.StatusPage(
             title="No Contacts",
             description="Connect your phone and tap \"Sync Contacts\"",
             icon_name="contact-new-symbolic",
             vexpand=True
         )
-        content.append(self.contacts_empty)
         self.contacts_empty.set_visible(True)
         self.contacts_list.set_visible(False)
 
-        # Active call banner
-        self.call_banner = Adw.Banner(title="📞 Calling…", button_label="End Call",
-                                      revealed=False)
+        self.call_banner = Adw.Banner(title="📞 Calling…", button_label="End Call", revealed=False)
         self.call_banner.connect("button-clicked", lambda _: self._end_call())
-        content.prepend(self.call_banner)
 
-        # Toast overlay wrapping content
+        # ToastOverlay as the toolbar's content (single parent)
         self.toast_overlay = Adw.ToastOverlay()
-        self.toast_overlay.set_child(content)
         self.toast_overlay.set_vexpand(True)
-        box.append(self.toast_overlay)
+        tb.set_content(self.toast_overlay)
+
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.toast_overlay.set_child(inner)
+        inner.append(self.call_banner)
+        inner.append(self.search_entry)
+
+        sw = Gtk.ScrolledWindow(vexpand=True)
+        inner.append(sw)
+        sw.set_child(self.contacts_list)
+        inner.append(self.contacts_empty)
 
         return box
 
@@ -609,7 +636,8 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
                 b.set_active(False)
                 b.handler_unblock_by_func(self._on_call_filter_toggled)
         self._active_call_filter = key
-        self.calls_list.invalidate_filter()
+        if hasattr(self, 'calls_list'):
+            self.calls_list.invalidate_filter()
 
     def _filter_call_row(self, row):
         f = self._active_call_filter
@@ -893,6 +921,24 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
 
     # ── CONTACTS ──────────────────────────────────────
 
+    def _load_from_cache(self):
+        """On startup: silently load contacts + calls from JSON cache if available"""
+        if os.path.exists(CONTACTS_CACHE):
+            try:
+                with open(CONTACTS_CACHE) as f:
+                    contacts = json.load(f)
+                if contacts:
+                    self._load_contacts_ui(contacts, f"📦 {len(contacts)} contacts (cached)")
+            except: pass
+        if os.path.exists(CALLS_CACHE):
+            try:
+                with open(CALLS_CACHE) as f:
+                    calls = json.load(f)
+                if calls:
+                    self._load_calls_ui(calls, f"📦 {len(calls)} calls (cached)")
+            except: pass
+        return False  # run once
+
     def _fetch_contacts(self):
         self._toast("Connecting to phonebook…")
         def do():
@@ -902,11 +948,19 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
             GLib.idle_add(self._load_contacts_ui, contacts, msg)
         threading.Thread(target=do, daemon=True).start()
 
+    def _fetch_calls(self):
+        self._toast("Fetching call history…")
+        def do():
+            calls, msg = self.pbap.fetch_call_history(
+                progress_cb=lambda m: GLib.idle_add(self._toast, m)
+            )
+            GLib.idle_add(self._load_calls_ui, calls, msg)
+        threading.Thread(target=do, daemon=True).start()
+
     def _load_contacts_ui(self, contacts, msg):
         self.all_contacts = contacts
         self._contacts_loaded = 0
 
-        # Clear old rows
         while True:
             child = self.contacts_list.get_first_child()
             if child is None: break
