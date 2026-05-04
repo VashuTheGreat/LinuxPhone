@@ -47,6 +47,7 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
         GLib.idle_add(self._load_from_cache)
         self.calls.set_incoming_callback(self._show_incoming_call_popup)
         self.calls.set_call_removed_callback(self._on_call_removed)
+        self.calls.set_call_state_changed_callback(self._on_call_state_changed)
         # Battery: poll every 30 s
         self.battery.add_callback(self._on_battery_update, self._on_signal_update)
         GLib.timeout_add(30000, self._poll_battery)
@@ -993,10 +994,24 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
             self._incoming_dialog = None
             self._incoming_call_path = None
         # Also close in-call dialog if it was active
-        if hasattr(self, 'active_call_dialog') and self.active_call_dialog:
-            try: self.active_call_dialog.close()
+        if hasattr(self, '_incall_dialog') and self._incall_dialog:
+            try: self._incall_dialog.close()
             except: pass
-            self.active_call_dialog = None
+            self._incall_dialog = None
+
+    def _on_call_state_changed(self, call_path, state, display_name):
+        """Called when a call changes state (e.g. from incoming to active when picked up on phone)"""
+        if getattr(self, '_incoming_call_path', None) == call_path and state == "active":
+            # Call was answered from the phone side
+            self._stop_ringtone()
+            if hasattr(self, '_incoming_dialog') and self._incoming_dialog:
+                try: self._incoming_dialog.close()
+                except: pass
+            self._incoming_dialog = None
+            self._incoming_call_path = None
+            
+            # Show the active call dialog
+            self._show_in_call_dialog(display_name, "Phone", outgoing=False)
 
     def _show_incoming_call_popup(self, number, call_path):
         """Show a full-screen-style incoming call dialog with Answer/Reject"""

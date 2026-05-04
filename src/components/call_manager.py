@@ -25,6 +25,10 @@ class CallManager:
         """cb(call_path) called when a call is disconnected/removed"""
         self._removed_cb = cb
 
+    def set_call_state_changed_callback(self, cb):
+        """cb(call_path, state) called when a call's state changes (e.g. to 'active')"""
+        self._state_cb = cb
+
     def _watch_calls(self):
         """Subscribe to oFono VoiceCallManager CallAdded and CallRemoved signals on system bus"""
         try:
@@ -40,6 +44,13 @@ class CallManager:
                 dbus_interface="org.ofono.VoiceCallManager",
                 bus_name="org.ofono"
             )
+            self._bus.add_signal_receiver(
+                self._on_call_property_changed,
+                signal_name="PropertyChanged",
+                dbus_interface="org.ofono.VoiceCall",
+                bus_name="org.ofono",
+                path_keyword="call_path"
+            )
         except Exception as e:
             print(f"[CallManager] Could not subscribe to Call signals: {e}")
 
@@ -49,6 +60,12 @@ class CallManager:
         line_id = str(props.get("LineIdentification", "Unknown"))
         name = str(props.get("Name", ""))
         display = name if name else line_id
+        
+        # Save display name for later state changes
+        if not hasattr(self, '_call_names'):
+            self._call_names = {}
+        self._call_names[str(call_path)] = display
+        
         if state == "incoming" and getattr(self, '_incoming_cb', None):
             GLib.idle_add(self._incoming_cb, display, str(call_path))
 
@@ -56,6 +73,13 @@ class CallManager:
         """Fires when a call is destroyed/disconnected"""
         if getattr(self, '_removed_cb', None):
             GLib.idle_add(self._removed_cb, str(call_path))
+            
+    def _on_call_property_changed(self, name, value, call_path=None):
+        if name == "State" and call_path:
+            state = str(value)
+            display = getattr(self, '_call_names', {}).get(str(call_path), "Unknown")
+            if getattr(self, '_state_cb', None):
+                GLib.idle_add(self._state_cb, str(call_path), state, display)
 
     def answer(self, call_path):
         """Answer an incoming call by its oFono object path"""
