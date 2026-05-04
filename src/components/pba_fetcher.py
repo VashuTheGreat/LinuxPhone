@@ -104,7 +104,14 @@ class PBAPFetcher:
                 except: pass
             return [], f"❌ Error: {str(e).split(':')[-1].strip()}"
 
-    def fetch_call_history(self, folder="cch", progress_cb=None):
+    def fetch_call_history(self, progress_cb=None):
+        """
+        Fetch call history from three separate PBAP folders for accurate types:
+          ich (incoming/received), och (outgoing/dialed), mch (missed)
+        Merges all, sorts by time descending, returns latest 150.
+        Falls back to cch if individual folders fail.
+        Falls back to cache if no phone connected.
+        """
         addr, name = self._get_connected_addr()
         if not addr:
             if os.path.exists(CALLS_CACHE):
@@ -114,32 +121,81 @@ class PBAPFetcher:
                     return calls, f"📦 Loaded {len(calls)} calls from cache (phone not connected)"
                 except: pass
             return [], "No connected device found"
+
         try:
-            if progress_cb: progress_cb("Fetching call history…")
+            if progress_cb: progress_cb("Connecting to phone…")
             sbus, client, session, pbap = self._create_session(addr)
-            pbap.Select("int", folder)
-            count = int(pbap.GetSize())
-            limit = min(count, 100)
-            if progress_cb: progress_cb(f"Downloading {limit} call records…")
-            self._pull_and_wait(sbus, pbap, "/tmp/lp_calls.vcf")
-            if progress_cb: progress_cb("Parsing call history…")
-            detailed = self._parse_call_vcf("/tmp/lp_calls.vcf")
-            self.call_history = detailed
-            try:
-                with open(CALLS_CACHE, 'w') as f:
-                    json.dump(detailed, f, ensure_ascii=False)
-            except: pass
+
+            all_calls = []
+
+            # Fetch each folder with its guaranteed type
+            folders = [
+                ("ich", "incoming"),   # Incoming (answered)
+                ("och", "outgoing"),   # Outgoing (dialed)
+                ("mch", "missed"),     # Missed
+            ]
+
+            for folder_id, forced_type in folders:
+                try:
+                    pbap.Select("int", folder_id)
+                    count = int(pbap.GetSize())
+                    limit = min(count, 60)   # 60 from each = up to 180 total
+                    if limit == 0:
+                        continue
+                    if progress_cb:
+                        progress_cb(f"Downloading {folder_id.upper()} ({limit} records)…")
+                    tmp = f"/tmp/lp_calls_{folder_id}.vcf"
+                    self._pull_and_wait(sbus, pbap, tmp)
+                    parsed = self._parse_call_vcf(tmp)
+                    # Override type with the folder's guaranteed type
+                    for c in parsed:
+                        c["type"] = forced_type
+                    all_calls.extend(parsed)
+                except Exception as e:
+                    if progress_cb: progress_cb(f"⚠ {folder_id}: {str(e)[-40:]}")
+
             try: client.RemoveSession(session)
             except: pass
-            return detailed, f"✅ Loaded {len(detailed)} recent calls"
+
+            if not all_calls:
+                # Fallback: try combined cch folder
+                if progress_cb: progress_cb("Trying combined folder…")
+                sbus2, client2, session2, pbap2 = self._create_session(addr)
+                pbap2.Select("int", "cch")
+                count = int(pbap2.GetSize())
+                if progress_cb: progress_cb(f"Downloading {min(count,100)} call records…")
+                self._pull_and_wait(sbus2, pbap2, "/tmp/lp_calls_cch.vcf")
+                all_calls = self._parse_call_vcf("/tmp/lp_calls_cch.vcf")
+                try: client2.RemoveSession(session2)
+                except: pass
+
+            # Sort by time descending (most recent first), keep latest 150
+            def sort_key(c):
+                t = c.get("time", "")
+                return t if t else "0"
+            all_calls.sort(key=sort_key, reverse=True)
+            all_calls = all_calls[:150]
+
+            self.call_history = all_calls
+            try:
+                with open(CALLS_CACHE, 'w') as f:
+                    json.dump(all_calls, f, ensure_ascii=False)
+            except: pass
+
+            incoming = sum(1 for c in all_calls if c["type"] == "incoming")
+            outgoing = sum(1 for c in all_calls if c["type"] == "outgoing")
+            missed   = sum(1 for c in all_calls if c["type"] == "missed")
+            return all_calls, f"✅ {len(all_calls)} calls — ↙{incoming} ↗{outgoing} ✕{missed}"
+
         except Exception as e:
             if os.path.exists(CALLS_CACHE):
                 try:
                     with open(CALLS_CACHE) as f:
                         calls = json.load(f)
-                    return calls, f"⚠ Error syncing, showing cached data ({len(calls)} calls)"
+                    return calls, f"⚠ Error syncing, cached data ({len(calls)} calls)"
                 except: pass
             return [], f"❌ {str(e).split(':')[-1].strip()}"
+
 
     def _parse_vcf(self, filepath):
         contacts = []

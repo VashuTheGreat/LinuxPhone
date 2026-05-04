@@ -1097,8 +1097,9 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
 
     def _on_battery_update(self, level):
         """level 0–5; called on GLib main thread."""
-        pct = self.battery.get_battery_percent(level)
+        pct, tooltip = self.battery.get_battery_percent(level)
         self._battery_lbl.set_text(f"🔋 {pct}")
+        self._battery_lbl.set_tooltip_text(tooltip)
         self._battery_lbl.set_visible(True)
         # Low battery style
         ctx = self._battery_lbl.get_style_context()
@@ -1106,6 +1107,7 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
             ctx.add_class("battery-low")
         else:
             ctx.remove_class("battery-low")
+
 
     def _on_signal_update(self, bars, carrier):
         """bars 0–5, carrier str."""

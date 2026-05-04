@@ -96,22 +96,29 @@ class BatteryMonitor:
             return "battery-missing-symbolic"
         return self.BATTERY_ICONS[min(level, 5)]
 
-    # HFP gives 0-5 scale. Map each to a midpoint range label.
+    # HFP BatteryChargeLevel is 0–5 (coarse). Each level covers a 20% range.
+    # Level 2 = 21–40%, Level 3 = 41–60%, etc.
+    # The phone itself decides which level to report — we can't get exact %.
     BATTERY_RANGES = [
-        "<20%",    # 0
-        "~20%",    # 1
-        "~40%",    # 2  (your 45% shows here)
-        "~60%",    # 3
-        "~80%",    # 4
-        "~100%",   # 5
+        ("<20%",   "0–20%"),    # level 0
+        ("~20%",   "1–20%"),    # level 1
+        ("~40%",   "21–40%"),   # level 2  ← 45% still here until phone reports level 3
+        ("~60%",   "41–60%"),   # level 3
+        ("~80%",   "61–80%"),   # level 4
+        ("~100%",  "81–100%"),  # level 5
     ]
 
     def get_battery_percent(self, level):
         """Return approximate percent label for HFP battery level 0–5.
-        HFP only gives a 0-5 coarse level — exact % is not available via Bluetooth."""
+        HFP only provides a 0-5 coarse level — exact % not available via Bluetooth."""
         if level < 0:
-            return "?%"
-        return self.BATTERY_RANGES[min(level, 5)]
+            return "?%", "Battery unknown"
+        label, range_str = self.BATTERY_RANGES[min(level, 5)]
+        tooltip = (f"Battery level: {label}\n"
+                   f"Bluetooth HFP reports a 0–5 scale.\n"
+                   f"Level {level} ≈ {range_str}\n"
+                   f"Exact % not available via Bluetooth.")
+        return label, tooltip
 
     def get_signal_icon(self, bars):
         """Return symbolic icon name for signal bars 0–5."""
