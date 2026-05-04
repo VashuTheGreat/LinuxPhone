@@ -13,415 +13,14 @@ from gi.repository import Gtk, Adw, GLib, Gdk, Gio, GObject, Pango
 import dbus, dbus.mainloop.glib
 import threading, subprocess, time, vobject, io, re, json, os
 from datetime import datetime
-
-CACHE_DIR = os.path.expanduser("~/.cache/linuxphone")
-os.makedirs(CACHE_DIR, exist_ok=True)
-CONTACTS_CACHE = os.path.join(CACHE_DIR, "contacts.json")
-CALLS_CACHE    = os.path.join(CACHE_DIR, "calls.json")
-
+from src.components.bluetooth_manager import BluetoothManager
+from src.components.pba_fetcher import PBAPFetcher
+from src.components.call_manager import CallManager
+from src.components.battery_monitor import BatteryMonitor
+from src.components.media_controller import MediaController
+from src.components.sms_manager import SmsManager
+from src.constants import CONTACTS_CACHE, CALLS_CACHE, SMS_CACHE
 dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
-
-# ══════════════════════════════════════════════════════
-#  BLUETOOTH MANAGER
-# ══════════════════════════════════════════════════════
-
-class BluetoothManager:
-    def __init__(self):
-        self.bus = dbus.SystemBus()
-        self.adapter_path = None
-        self.adapter = None
-        self.devices = {}
-        self._init_adapter()
-
-    def _init_adapter(self):
-        try:
-            mgr = dbus.Interface(self.bus.get_object("org.bluez", "/"),
-                                 "org.freedesktop.DBus.ObjectManager")
-            for path, ifaces in mgr.GetManagedObjects().items():
-                if "org.bluez.Adapter1" in ifaces:
-                    self.adapter_path = path
-                    self.adapter = dbus.Interface(
-                        self.bus.get_object("org.bluez", path), "org.bluez.Adapter1")
-                    break
-        except: pass
-
-    def get_devices(self):
-        devs = {}
-        try:
-            mgr = dbus.Interface(self.bus.get_object("org.bluez", "/"),
-                                 "org.freedesktop.DBus.ObjectManager")
-            for path, ifaces in mgr.GetManagedObjects().items():
-                if "org.bluez.Device1" in ifaces:
-                    p = ifaces["org.bluez.Device1"]
-                    addr = str(p.get("Address", ""))
-                    if addr:
-                        devs[addr] = {
-                            "name": str(p.get("Name", addr)),
-                            "address": addr,
-                            "paired": bool(p.get("Paired", False)),
-                            "connected": bool(p.get("Connected", False)),
-                            "uuids": [str(u).lower() for u in p.get("UUIDs", [])],
-                            "path": str(path)
-                        }
-        except: pass
-        self.devices = devs
-        return devs
-
-    def connect(self, addr):
-        try:
-            dev = self.devices.get(addr)
-            if not dev: return False, "Not found"
-            dbus.Interface(self.bus.get_object("org.bluez", dev["path"]),
-                           "org.bluez.Device1").Connect()
-            return True, "Connected"
-        except dbus.DBusException as e:
-            return False, str(e).split(": ")[-1]
-
-    def disconnect(self, addr):
-        try:
-            dev = self.devices.get(addr)
-            if not dev: return False, "Not found"
-            dbus.Interface(self.bus.get_object("org.bluez", dev["path"]),
-                           "org.bluez.Device1").Disconnect()
-            return True, "Disconnected"
-        except dbus.DBusException as e:
-            return False, str(e).split(": ")[-1]
-
-    def scan(self, duration=8):
-        try:
-            self.adapter.StartDiscovery()
-            time.sleep(duration)
-            self.adapter.StopDiscovery()
-        except: pass
-        return self.get_devices()
-
-    def adapter_info(self):
-        if not self.adapter_path: return {}
-        try:
-            props = dbus.Interface(self.bus.get_object("org.bluez", self.adapter_path),
-                                   "org.freedesktop.DBus.Properties")
-            a = props.GetAll("org.bluez.Adapter1")
-            return {"name": str(a.get("Name","?")),
-                    "address": str(a.get("Address","?")),
-                    "powered": bool(a.get("Powered", False))}
-        except: return {}
-
-
-# ══════════════════════════════════════════════════════
-#  PBAP CONTACTS FETCHER
-# ══════════════════════════════════════════════════════
-
-class PBAPFetcher:
-    """Fetch contacts & call history from phone via Bluetooth PBAP"""
-
-    def __init__(self, bt: BluetoothManager):
-        self.bt = bt
-        self.contacts = []
-        self.call_history = []
-
-    def _get_connected_addr(self):
-        devs = self.bt.get_devices()
-        pbap_uuid = "0000112f-0000-1000-8000-00805f9b34fb"
-        for addr, dev in devs.items():
-            if dev["connected"] and any(pbap_uuid in u for u in dev["uuids"]):
-                return addr, dev["name"]
-        # fallback: any connected device
-        for addr, dev in devs.items():
-            if dev["connected"]:
-                return addr, dev["name"]
-        return None, None
-
-    def _create_session(self, addr):
-        sbus = dbus.SessionBus()
-        client = dbus.Interface(
-            sbus.get_object("org.bluez.obex", "/org/bluez/obex"),
-            "org.bluez.obex.Client1"
-        )
-        session_path = client.CreateSession(addr, {"Target": dbus.String("pbap")})
-        pbap = dbus.Interface(
-            sbus.get_object("org.bluez.obex", session_path),
-            "org.bluez.obex.PhonebookAccess1"
-        )
-        return sbus, client, session_path, pbap
-
-    def _pull_and_wait(self, sbus, pbap, dest_path):
-        """Pull phonebook and wait for completion by polling file size"""
-        import os
-        transfer_path, _ = pbap.PullAll(dest_path, dbus.Dictionary({}, signature='sv'))
-        # Poll until file stops growing (transfer complete)
-        prev_size = -1
-        stable_count = 0
-        for _ in range(120):
-            time.sleep(0.5)
-            try:
-                size = os.path.getsize(dest_path)
-                if size > 0 and size == prev_size:
-                    stable_count += 1
-                    if stable_count >= 3:
-                        break
-                else:
-                    stable_count = 0
-                prev_size = size
-            except:
-                pass
-        return dest_path
-
-    def fetch_contacts(self, progress_cb=None):
-        addr, name = self._get_connected_addr()
-        if not addr:
-            # Try loading from cache
-            if os.path.exists(CONTACTS_CACHE):
-                try:
-                    with open(CONTACTS_CACHE) as f:
-                        contacts = json.load(f)
-                    return contacts, f"📦 Loaded {len(contacts)} contacts from cache (phone not connected)"
-                except: pass
-            return [], "No connected device found"
-        try:
-            if progress_cb: progress_cb(f"Connecting to {name}…")
-            sbus, client, session, pbap = self._create_session(addr)
-            pbap.Select("int", "pb")
-            count = int(pbap.GetSize())
-            if progress_cb: progress_cb(f"Downloading {count} contacts…")
-            self._pull_and_wait(sbus, pbap, "/tmp/lp_contacts.vcf")
-            if progress_cb: progress_cb("Parsing contacts…")
-            contacts = self._parse_vcf("/tmp/lp_contacts.vcf")
-            self.contacts = contacts
-            # Save to JSON cache
-            try:
-                with open(CONTACTS_CACHE, 'w') as f:
-                    json.dump(contacts, f, ensure_ascii=False)
-            except: pass
-            try: client.RemoveSession(session)
-            except: pass
-            return contacts, f"✅ Loaded {len(contacts)} contacts from {name}"
-        except Exception as e:
-            # Fallback to cache
-            if os.path.exists(CONTACTS_CACHE):
-                try:
-                    with open(CONTACTS_CACHE) as f:
-                        contacts = json.load(f)
-                    return contacts, f"⚠ Error syncing, showing cached data ({len(contacts)} contacts)"
-                except: pass
-            return [], f"❌ Error: {str(e).split(':')[-1].strip()}"
-
-    def fetch_call_history(self, folder="cch", progress_cb=None):
-        addr, name = self._get_connected_addr()
-        if not addr:
-            if os.path.exists(CALLS_CACHE):
-                try:
-                    with open(CALLS_CACHE) as f:
-                        calls = json.load(f)
-                    return calls, f"📦 Loaded {len(calls)} calls from cache (phone not connected)"
-                except: pass
-            return [], "No connected device found"
-        try:
-            if progress_cb: progress_cb("Fetching call history…")
-            sbus, client, session, pbap = self._create_session(addr)
-            pbap.Select("int", folder)
-            count = int(pbap.GetSize())
-            limit = min(count, 100)
-            if progress_cb: progress_cb(f"Downloading {limit} call records…")
-            self._pull_and_wait(sbus, pbap, "/tmp/lp_calls.vcf")
-            if progress_cb: progress_cb("Parsing call history…")
-            detailed = self._parse_call_vcf("/tmp/lp_calls.vcf")
-            self.call_history = detailed
-            try:
-                with open(CALLS_CACHE, 'w') as f:
-                    json.dump(detailed, f, ensure_ascii=False)
-            except: pass
-            try: client.RemoveSession(session)
-            except: pass
-            return detailed, f"✅ Loaded {len(detailed)} recent calls"
-        except Exception as e:
-            if os.path.exists(CALLS_CACHE):
-                try:
-                    with open(CALLS_CACHE) as f:
-                        calls = json.load(f)
-                    return calls, f"⚠ Error syncing, showing cached data ({len(calls)} calls)"
-                except: pass
-            return [], f"❌ {str(e).split(':')[-1].strip()}"
-
-    def _parse_vcf(self, filepath):
-        contacts = []
-        try:
-            with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
-                data = f.read()
-            for vcard in vobject.readComponents(data):
-                name = ""
-                phones = []
-                try:
-                    if hasattr(vcard, 'fn') and vcard.fn.value.strip():
-                        name = vcard.fn.value.strip()
-                    elif hasattr(vcard, 'n'):
-                        n = vcard.n.value
-                        parts = [n.given, n.family, n.additional]
-                        name = " ".join(p for p in parts if p).strip()
-                except: pass
-                try:
-                    for tel in vcard.contents.get('tel', []):
-                        num = re.sub(r'[^\d+\-\s\(\)]', '', str(tel.value)).strip()
-                        if num and num not in phones:
-                            phones.append(num)
-                except: pass
-                if name or phones:
-                    contacts.append({
-                        "name": name or (phones[0] if phones else "Unknown"),
-                        "phones": phones,
-                        "initial": (name[0].upper() if name else "#")
-                    })
-        except Exception as e:
-            pass
-        # Remove duplicates by name+phone, sort
-        seen = set()
-        unique = []
-        for c in contacts:
-            key = c["name"] + (c["phones"][0] if c["phones"] else "")
-            if key not in seen:
-                seen.add(key)
-                unique.append(c)
-        unique.sort(key=lambda c: c["name"].lower())
-        return unique
-
-    def _parse_call_vcf(self, filepath):
-        calls = []
-        try:
-            with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
-                data = f.read()
-            for vcard in vobject.readComponents(data):
-                name = ""
-                number = ""
-                call_type = "unknown"
-                call_time = ""
-                try:
-                    if hasattr(vcard, 'fn'):
-                        name = vcard.fn.value.strip()
-                    for tel in vcard.contents.get('tel', []):
-                        number = re.sub(r'[^\d+\-\s]', '', str(tel.value)).strip()
-                        # Check X-IRMC-CALL-DATETIME
-                    for key, vals in vcard.contents.items():
-                        if 'call-datetime' in key.lower() or 'x-irmc' in key.lower():
-                            for v in vals:
-                                raw = str(v.value)
-                                # MISSED/RECEIVED/DIALED tag
-                                params = str(getattr(v, 'params', {}))
-                                if 'MISSED' in params.upper(): call_type = 'missed'
-                                elif 'RECEIVED' in params.upper(): call_type = 'incoming'
-                                elif 'DIALED' in params.upper(): call_type = 'outgoing'
-                                call_time = raw[:15] if raw else ""
-                except: pass
-                if number or name:
-                    calls.append({
-                        "name": name or number or "Unknown",
-                        "number": number,
-                        "type": call_type,
-                        "time": call_time
-                    })
-        except: pass
-        return calls
-
-
-# ══════════════════════════════════════════════════════
-#  CALL MANAGER
-# ══════════════════════════════════════════════════════
-
-class CallManager:
-    def __init__(self):
-        self.active_call = None
-        self.call_log = []
-        self._bus = dbus.SystemBus()
-        self._incoming_cb = None   # set by window to show incoming call popup
-        self._watch_calls()
-
-    def set_incoming_callback(self, cb):
-        """cb(number, call_path) called when an incoming call arrives"""
-        self._incoming_cb = cb
-
-    def _watch_calls(self):
-        """Subscribe to oFono VoiceCallManager.CallAdded signal on system bus"""
-        try:
-            self._bus.add_signal_receiver(
-                self._on_call_added,
-                signal_name="CallAdded",
-                dbus_interface="org.ofono.VoiceCallManager",
-                bus_name="org.ofono",
-                path_keyword="sender_path"
-            )
-        except Exception as e:
-            print(f"[CallManager] Could not subscribe to CallAdded: {e}")
-
-    def _on_call_added(self, call_path, props, sender_path=None):
-        """Fires when oFono announces a new call (incoming or outgoing)"""
-        state = str(props.get("State", ""))
-        line_id = str(props.get("LineIdentification", "Unknown"))
-        name = str(props.get("Name", ""))
-        display = name if name else line_id
-        if state == "incoming" and self._incoming_cb:
-            GLib.idle_add(self._incoming_cb, display, str(call_path))
-
-    def answer(self, call_path):
-        """Answer an incoming call by its oFono object path"""
-        try:
-            call_iface = dbus.Interface(
-                self._bus.get_object("org.ofono", call_path),
-                "org.ofono.VoiceCall"
-            )
-            call_iface.Answer()
-            self.active_call = {"number": call_path, "name": call_path,
-                                "start": datetime.now(), "path": call_path}
-            return True, "Call answered"
-        except dbus.DBusException as e:
-            return False, str(e).split(": ")[-1]
-
-    def reject(self, call_path):
-        """Reject / hang up a specific incoming call"""
-        try:
-            call_iface = dbus.Interface(
-                self._bus.get_object("org.ofono", call_path),
-                "org.ofono.VoiceCall"
-            )
-            call_iface.Hangup()
-            return True, "Call rejected"
-        except dbus.DBusException as e:
-            return False, str(e).split(": ")[-1]
-
-    def _get_modem(self):
-        try:
-            mgr = dbus.Interface(self._bus.get_object("org.ofono", "/"), "org.ofono.Manager")
-            for path, props in mgr.GetModems():
-                if props.get("Online") and props.get("Powered"):
-                    ifaces = list(props.get("Interfaces", []))
-                    if "org.ofono.VoiceCallManager" in ifaces:
-                        return str(path), str(props.get("Name", path))
-        except: pass
-        return None, None
-
-    def call(self, number):
-        number = re.sub(r'[^\d+]', '', number)
-        if not number: return False, "Invalid number"
-        path, name = self._get_modem()
-        if not path: return False, "No HFP modem. Is phone connected?"
-        try:
-            vcm = dbus.Interface(self._bus.get_object("org.ofono", path),
-                                 "org.ofono.VoiceCallManager")
-            call_path = vcm.Dial(number, "")
-            self.active_call = {"number": number, "name": name,
-                                "start": datetime.now(), "path": str(call_path)}
-            self.call_log.insert(0, {"number": number, "time": datetime.now().strftime("%H:%M %d/%m"),
-                                     "type": "outgoing", "modem": name})
-            return True, f"Calling {number} via {name}…"
-        except dbus.DBusException as e:
-            return False, str(e).split(": ")[-1]
-
-    def hangup(self):
-        path, _ = self._get_modem()
-        try:
-            if path:
-                dbus.Interface(self._bus.get_object("org.ofono", path),
-                               "org.ofono.VoiceCallManager").HangupAll()
-        except: pass
-        self.active_call = None
-        return True, "Call ended"
 
 
 # ══════════════════════════════════════════════════════
@@ -431,21 +30,33 @@ class CallManager:
 class LinuxPhoneWindow(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="LinuxPhone")
-        self.set_default_size(900, 650)
-        self.set_default_size(900, 650)
+        self.set_default_size(1000, 680)
 
         self.bt = BluetoothManager()
         self.pbap = PBAPFetcher(self.bt)
         self.calls = CallManager()
+        self.battery = BatteryMonitor()
+        self.media = MediaController()
+        self.sms = SmsManager()
         self.all_contacts = []
         self._call_timer_id = None
+        self._sms_threads = []          # list of {sender, body, time}
 
         self._build_ui()
         GLib.timeout_add(15000, self._auto_refresh_devices)
-        # Load from cache on startup — no Bluetooth needed
         GLib.idle_add(self._load_from_cache)
-        # Hook incoming call popup
         self.calls.set_incoming_callback(self._show_incoming_call_popup)
+        # Battery: poll every 30 s
+        self.battery.add_callback(self._on_battery_update, self._on_signal_update)
+        GLib.timeout_add(30000, self._poll_battery)
+        GLib.idle_add(self._poll_battery)
+        # Media: poll every 2 s
+        self.media.add_track_callback(self._on_track_update)
+        self.media.add_status_callback(self._on_media_status)
+        GLib.timeout_add(2000, self._poll_media)
+        GLib.idle_add(self._poll_media)
+        # SMS incoming
+        self.sms.set_incoming_callback(self._on_sms_incoming)
 
     # ── UI BUILD ──────────────────────────────────────
 
@@ -474,23 +85,28 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
         root.append(self.nav_view)
         self.nav_view.set_vexpand(True)
 
-        # Sidebar
+        # ── Sidebar ──────────────────────────────────
         sidebar_page = Adw.NavigationPage(title="LinuxPhone")
         sidebar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         sidebar_page.set_child(sidebar_box)
         self.nav_view.set_sidebar(sidebar_page)
 
-        # Sidebar list
+        # --- Device status card ---
+        self._device_card = self._build_device_card()
+        sidebar_box.append(self._device_card)
+
+        # Nav list
         self.nav_list = Gtk.ListBox(css_classes=["navigation-sidebar"])
         self.nav_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
         self.nav_list.connect("row-selected", self._on_nav_selected)
         sidebar_box.append(self.nav_list)
 
         pages = [
-            ("contact-new-symbolic",               "Contacts"),
-            ("call-start-symbolic",                "Recent Calls"),
-            ("audio-input-microphone-symbolic",    "Dial Pad"),
-            ("bluetooth-symbolic",                 "Devices"),
+            ("contact-new-symbolic",            "Contacts"),
+            ("call-start-symbolic",             "Recent Calls"),
+            ("audio-input-microphone-symbolic", "Dial Pad"),
+            ("message-new-symbolic",            "Messages"),
+            ("bluetooth-symbolic",              "Devices"),
         ]
         for icon, label in pages:
             row = Adw.ActionRow(title=label)
@@ -498,12 +114,16 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
             row.set_activatable(True)
             self.nav_list.append(row)
 
-        # Status badge in sidebar
+        # --- Media player card ---
+        self._media_card = self._build_media_card()
+        sidebar_box.append(self._media_card)
+
+        # Status label
         self.status_label = Gtk.Label(label="", css_classes=["caption", "dim-label"],
                                       xalign=0, margin_start=12, margin_bottom=8, wrap=True)
         sidebar_box.append(self.status_label)
 
-        # Content area (stack)
+        # ── Content area (stack) ───────────────────
         content_page = Adw.NavigationPage(title="Contacts & Calls")
         self.content_page = content_page
         self.nav_view.set_content(content_page)
@@ -515,12 +135,102 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
         self.stack.add_named(self._build_contacts_page(), "contacts")
         self.stack.add_named(self._build_calls_page(), "calls")
         self.stack.add_named(self._build_dialpad_page(), "dialpad")
+        self.stack.add_named(self._build_messages_page(), "messages")
         self.stack.add_named(self._build_devices_page(), "devices")
 
         self.stack.set_visible_child_name("contacts")
         self.nav_list.select_row(self.nav_list.get_row_at_index(0))
 
         self._refresh_devices()
+
+    # ── DEVICE CARD (sidebar) ─────────────────────────
+
+    def _build_device_card(self):
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
+                       spacing=4, css_classes=["device-card"])
+
+        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        card.append(top)
+
+        # Phone icon
+        phone_icon = Gtk.Image(icon_name="phone-symbolic", pixel_size=28)
+        top.append(phone_icon)
+
+        info_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1,
+                           hexpand=True)
+        top.append(info_box)
+
+        self._dev_name_lbl = Gtk.Label(label="No Device",
+                                       css_classes=["device-name"],
+                                       xalign=0)
+        info_box.append(self._dev_name_lbl)
+
+        self._dev_status_lbl = Gtk.Label(label="Not connected",
+                                         css_classes=["device-sub"],
+                                         xalign=0)
+        info_box.append(self._dev_status_lbl)
+
+        # Battery badge
+        self._battery_lbl = Gtk.Label(label="",
+                                      css_classes=["battery-badge"],
+                                      visible=False)
+        top.append(self._battery_lbl)
+
+        # Signal + carrier row
+        self._signal_lbl = Gtk.Label(label="", css_classes=["signal-badge"],
+                                     xalign=0, visible=False)
+        card.append(self._signal_lbl)
+
+        return card
+
+    # ── MEDIA CARD (sidebar) ──────────────────────────
+
+    def _build_media_card(self):
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
+                       spacing=6, css_classes=["media-card"],
+                       visible=False)
+        self._media_card_box = card
+
+        # Track info
+        self._media_title_lbl = Gtk.Label(label="Not Playing",
+                                          css_classes=["media-title"],
+                                          xalign=0,
+                                          ellipsize=Pango.EllipsizeMode.END,
+                                          max_width_chars=22)
+        card.append(self._media_title_lbl)
+
+        self._media_artist_lbl = Gtk.Label(label="",
+                                           css_classes=["media-artist"],
+                                           xalign=0,
+                                           ellipsize=Pango.EllipsizeMode.END,
+                                           max_width_chars=22)
+        card.append(self._media_artist_lbl)
+
+        # Controls row
+        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
+                          spacing=6, halign=Gtk.Align.CENTER)
+        card.append(btn_row)
+
+        prev_btn = Gtk.Button(icon_name="media-skip-backward-symbolic",
+                              css_classes=["flat", "media-btn"],
+                              tooltip_text="Previous")
+        prev_btn.connect("clicked", lambda _: self.media.previous_track())
+        btn_row.append(prev_btn)
+
+        self._play_pause_btn = Gtk.Button(icon_name="media-playback-start-symbolic",
+                                          css_classes=["flat", "media-play-btn"],
+                                          tooltip_text="Play / Pause")
+        self._play_pause_btn.connect("clicked", lambda _: self.media.play_pause())
+        btn_row.append(self._play_pause_btn)
+
+        next_btn = Gtk.Button(icon_name="media-skip-forward-symbolic",
+                              css_classes=["flat", "media-btn"],
+                              tooltip_text="Next")
+        next_btn.connect("clicked", lambda _: self.media.next_track())
+        btn_row.append(next_btn)
+
+        return card
+
 
     # ── CONTACTS PAGE ─────────────────────────────────
 
@@ -685,7 +395,6 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
     def _on_call_filter_toggled(self, btn, key):
         if not btn.get_active():
             return
-        # Untoggle others
         for k, b in self.call_filter_btns.items():
             if k != key:
                 b.handler_block_by_func(self._on_call_filter_toggled)
@@ -705,13 +414,12 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
     def _make_call_row(self, call):
         row = Adw.ActionRow()
         name = self._escape(call.get("name") or call.get("number") or "Unknown")
-        number = self._escape(call.get("number", ""))
+        num  = call.get("number", "")
         row.set_title(name)
 
-        # Subtitle: type + time
+        # Subtitle: formatted time
         ctype = call.get("type", "unknown")
         ctime = call.get("time", "")
-        # Format time if available (YYYYMMDDTHHMMSS)
         time_str = ""
         if ctime and len(ctime) >= 8:
             try:
@@ -719,38 +427,40 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
                 time_str = dt.strftime("%d %b, %I:%M %p")
             except:
                 time_str = ctime[:15]
-        subtitle = time_str if time_str else number
-        row.set_subtitle(subtitle)
+        row.set_subtitle(time_str if time_str else self._escape(num))
 
-        # Type icon prefix
+        # Color + icon based on call type
         if ctype == "incoming":
-            icon_name = "call-start-symbolic"
-            color_class = "success"
-            label_text = "↙ Incoming"
+            icon_name   = "call-start-symbolic"
+            color_class = "success"       # green
+            label_text  = "↙ Incoming"
         elif ctype == "outgoing":
-            icon_name = "call-start-symbolic"
-            color_class = "accent"
-            label_text = "↗ Outgoing"
+            icon_name   = "call-start-symbolic"
+            color_class = "accent"        # blue/accent
+            label_text  = "↗ Outgoing"
         elif ctype == "missed":
-            icon_name = "call-missed-symbolic"
-            color_class = "error"
-            label_text = "✗ Missed"
+            icon_name   = "call-missed-symbolic"
+            color_class = "error"         # red
+            label_text  = "✕ Missed"
         else:
-            icon_name = "call-start-symbolic"
+            icon_name   = "call-start-symbolic"
             color_class = "dim-label"
-            label_text = "Call"
+            label_text  = "Call"
 
-        type_label = Gtk.Label(label=label_text,
-                               css_classes=["caption", color_class],
-                               xalign=0)
-        icon = Gtk.Image(icon_name=icon_name, css_classes=[color_class])
+        # Prefix: colored icon above type label
+        icon = Gtk.Image(icon_name=icon_name, css_classes=[color_class],
+                         pixel_size=18)
+        type_lbl = Gtk.Label(label=label_text,
+                             css_classes=["caption", color_class],
+                             xalign=0.5)
         prefix_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
-                             valign=Gtk.Align.CENTER, spacing=2)
+                             valign=Gtk.Align.CENTER, spacing=1,
+                             width_request=68)
         prefix_box.append(icon)
+        prefix_box.append(type_lbl)
         row.add_prefix(prefix_box)
 
-        # Call back button
-        num = call.get("number", "")
+        # Call-back button (suffix)
         if num:
             cb_btn = Gtk.Button(icon_name="call-start-symbolic",
                                 css_classes=["flat", "circular"],
@@ -761,6 +471,7 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
 
         row._call = call
         return row
+
 
     def _fetch_calls(self):
         self._toast("Fetching call history…")
@@ -895,8 +606,8 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
     def _on_nav_selected(self, listbox, row):
         if row is None: return
         idx = row.get_index()
-        pages = ["contacts", "calls", "dialpad", "devices"]
-        titles = ["Contacts", "Recent Calls", "Dial Pad", "Devices"]
+        pages  = ["contacts", "calls", "dialpad", "messages", "devices"]
+        titles = ["Contacts", "Recent Calls", "Dial Pad", "Messages", "Devices"]
         if idx < len(pages):
             self.stack.set_visible_child_name(pages[idx])
             self.content_page.set_title(titles[idx])
@@ -950,8 +661,15 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
 
         if connected_names:
             self.status_label.set_text("Connected: " + ", ".join(connected_names))
+            self._dev_name_lbl.set_text(connected_names[0])
+            self._dev_status_lbl.set_text("● Connected")
         else:
             self.status_label.set_text("No devices connected")
+            self._dev_name_lbl.set_text("No Device")
+            self._dev_status_lbl.set_text("Not connected")
+            self._battery_lbl.set_visible(False)
+            self._signal_lbl.set_visible(False)
+            self._media_card_box.set_visible(False)
 
     def _dev_connect(self, addr):
         def do():
@@ -1232,12 +950,45 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
                     return name
         return None
 
+    # ── RINGTONE ───────────────────────────────────────
+
+    RING_SOUND = "/usr/share/sounds/freedesktop/stereo/phone-incoming-call.oga"
+
+    def _play_ringtone(self):
+        """Play system ringtone in a loop until _stop_ringtone() is called."""
+        self._ring_proc = None
+        self._ring_stop = False
+        def _loop():
+            while not self._ring_stop:
+                try:
+                    proc = subprocess.Popen(
+                        ["paplay", self.RING_SOUND],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL
+                    )
+                    self._ring_proc = proc
+                    proc.wait()
+                except Exception:
+                    break
+        threading.Thread(target=_loop, daemon=True).start()
+
+    def _stop_ringtone(self):
+        """Stop the ringtone loop."""
+        self._ring_stop = True
+        if hasattr(self, '_ring_proc') and self._ring_proc:
+            try: self._ring_proc.terminate()
+            except: pass
+            self._ring_proc = None
+
     def _show_incoming_call_popup(self, number, call_path):
         """Show a full-screen-style incoming call dialog with Answer/Reject"""
         # Prevent duplicate popups
         if hasattr(self, '_incoming_dialog') and self._incoming_dialog:
             try: self._incoming_dialog.close()
             except: pass
+
+        # 🔔 Start ringtone
+        self._play_ringtone()
 
         dialog = Adw.Dialog()
         dialog.set_title("Incoming Call")
@@ -1312,6 +1063,7 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
         btn_row.append(answer_box)
 
         def on_answer(_):
+            self._stop_ringtone()               # 🔕 stop ring
             ok, msg = self.calls.answer(self._incoming_call_path)
             self._toast(msg)
             dialog.close()
@@ -1320,18 +1072,195 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
                 self._show_in_call_dialog(display_name, number, outgoing=False)
 
         def on_reject(_):
+            self._stop_ringtone()               # 🔕 stop ring
             ok, msg = self.calls.reject(self._incoming_call_path)
             self._toast(msg)
             dialog.close()
             self._incoming_dialog = None
 
+        def on_closed(_):
+            self._stop_ringtone()               # 🔕 stop ring if window closed
+            self._incoming_dialog = None
+
         answer_btn.connect("clicked", on_answer)
         reject_btn.connect("clicked", on_reject)
-        dialog.connect("closed", lambda _: setattr(self, '_incoming_dialog', None))
+        dialog.connect("closed", on_closed)
 
         dialog.present(self)
         return False  # GLib.idle_add return
 
+    # ── BATTERY / SIGNAL CALLBACKS ────────────────────────
+
+    def _poll_battery(self):
+        threading.Thread(target=self.battery.poll, daemon=True).start()
+        return True
+
+    def _on_battery_update(self, level):
+        """level 0–5; called on GLib main thread."""
+        pct = self.battery.get_battery_percent(level)
+        self._battery_lbl.set_text(f"🔋 {pct}")
+        self._battery_lbl.set_visible(True)
+        # Low battery style
+        ctx = self._battery_lbl.get_style_context()
+        if level <= 1:
+            ctx.add_class("battery-low")
+        else:
+            ctx.remove_class("battery-low")
+
+    def _on_signal_update(self, bars, carrier):
+        """bars 0–5, carrier str."""
+        bar_chars = ["📵", "📶", "📶", "📶", "📶", "📶"]
+        icon = bar_chars[min(bars, 5)] if bars >= 0 else "📵"
+        text = f"{icon} {carrier}" if carrier else icon
+        self._signal_lbl.set_text(text)
+        self._signal_lbl.set_visible(bool(carrier))
+        # Update device card subtitle with connected device
+        devs = self.bt.get_devices()
+        for addr, dev in devs.items():
+            if dev["connected"]:
+                self._dev_name_lbl.set_text(dev["name"])
+                self._dev_status_lbl.set_text("● Connected")
+                return
+        self._dev_status_lbl.set_text("Not connected")
+
+    # ── MEDIA CALLBACKS ──────────────────────────────
+
+    def _poll_media(self):
+        threading.Thread(target=self.media.poll, daemon=True).start()
+        return True
+
+    def _on_track_update(self, title, artist, album, status, duration_ms, position_ms):
+        has_info = bool(title and title not in ("", "Not Provided"))
+        self._media_card_box.set_visible(has_info or status == "playing")
+        if has_info:
+            self._media_title_lbl.set_text(title)
+        else:
+            self._media_title_lbl.set_text("Unknown Track")
+        self._media_artist_lbl.set_text(artist or album or "")
+        self._update_play_btn(status)
+
+    def _on_media_status(self, status):
+        self._update_play_btn(status)
+        # If something is playing, make sure card is visible
+        if status == "playing":
+            self._media_card_box.set_visible(True)
+
+    def _update_play_btn(self, status):
+        icon = ("media-playback-pause-symbolic" if status == "playing"
+                else "media-playback-start-symbolic")
+        self._play_pause_btn.set_icon_name(icon)
+
+    # ── SMS MESSAGES PAGE ─────────────────────────────
+
+    def _build_messages_page(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+
+        tb = Adw.ToolbarView()
+        box.append(tb)
+        tb.set_vexpand(True)
+
+        top_bar = Adw.HeaderBar(show_start_title_buttons=False,
+                                show_end_title_buttons=False)
+        top_bar.set_title_widget(Gtk.Label(label="Messages",
+                                           css_classes=["heading"]))
+        tb.add_top_bar(top_bar)
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        tb.set_content(content)
+
+        # Scrollable message list
+        sw = Gtk.ScrolledWindow(vexpand=True)
+        content.append(sw)
+
+        self._sms_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
+                                 spacing=8,
+                                 margin_start=12, margin_end=12,
+                                 margin_top=12, margin_bottom=8)
+        sw.set_child(self._sms_list)
+
+        # Empty state
+        self._sms_empty = Adw.StatusPage(
+            title="No Messages",
+            description="Incoming SMS will appear here while your phone is connected via Bluetooth",
+            icon_name="message-new-symbolic",
+            vexpand=True
+        )
+        content.append(self._sms_empty)
+
+        # Compose bar
+        compose = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
+                          spacing=6,
+                          margin_start=12, margin_end=12,
+                          margin_bottom=12, margin_top=4)
+        content.append(compose)
+
+        self._sms_to_entry = Gtk.Entry(placeholder_text="Recipient number…",
+                                       width_chars=14)
+        compose.append(self._sms_to_entry)
+
+        self._sms_body_entry = Gtk.Entry(placeholder_text="Type a message…",
+                                         hexpand=True)
+        self._sms_body_entry.connect("activate", self._on_sms_send)
+        compose.append(self._sms_body_entry)
+
+        send_btn = Gtk.Button(icon_name="document-send-symbolic",
+                              css_classes=["suggested-action", "circular"],
+                              tooltip_text="Send SMS")
+        send_btn.connect("clicked", self._on_sms_send)
+        compose.append(send_btn)
+
+        if not self.sms.can_send_sms():
+            compose.set_sensitive(False)
+            compose.set_tooltip_text("SMS requires Bluetooth HFP + oFono MessageManager")
+
+        return box
+
+    def _on_sms_incoming(self, sender, body, timestamp):
+        self._sms_empty.set_visible(False)
+        row = self._make_sms_row(sender, body, timestamp, incoming=True)
+        self._sms_list.prepend(row)
+        self._toast(f"SMS from {sender}: {body[:40]}")
+
+    def _on_sms_send(self, _):
+        number = self._sms_to_entry.get_text().strip()
+        body   = self._sms_body_entry.get_text().strip()
+        if not number or not body:
+            self._toast("Enter a recipient and message")
+            return
+        ok, msg = self.sms.send_sms(number, body)
+        self._toast(msg)
+        if ok:
+            self._sms_empty.set_visible(False)
+            row = self._make_sms_row("Me → " + number, body, "", incoming=False)
+            self._sms_list.prepend(row)
+            self._sms_body_entry.set_text("")
+
+    def _make_sms_row(self, sender, body, timestamp, incoming=True):
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+
+        sender_lbl = Gtk.Label(label=self._escape(sender),
+                               css_classes=["caption", "dim-label"],
+                               xalign=0 if incoming else 1)
+        outer.append(sender_lbl)
+
+        bubble = Gtk.Label(label=self._escape(body),
+                           wrap=True,
+                           xalign=0,
+                           css_classes=["sms-bubble-them" if incoming
+                                        else "sms-bubble-me"],
+                           halign=Gtk.Align.START if incoming else Gtk.Align.END)
+        outer.append(bubble)
+
+        if timestamp:
+            ts_lbl = Gtk.Label(label=timestamp[:16],
+                               css_classes=["sms-time"],
+                               xalign=0 if incoming else 1)
+            outer.append(ts_lbl)
+
+        sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL,
+                            margin_top=4)
+        outer.append(sep)
+        return outer
 
 # ══════════════════════════════════════════════════════
 #  APPLICATION
@@ -1348,25 +1277,4 @@ class LinuxPhoneApp(Adw.Application):
         win.present()
 
 
-# ── CSS ──────────────────────────────────────────────
 
-CSS = """
-.contact-avatar {
-    background-color: @accent_bg_color;
-    color: @accent_fg_color;
-    border-radius: 50%;
-}
-"""
-
-def main():
-    app = LinuxPhoneApp()
-    provider = Gtk.CssProvider()
-    provider.load_from_data(CSS.encode())
-    Gtk.StyleContext.add_provider_for_display(
-        Gdk.Display.get_default(), provider,
-        Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
-    )
-    app.run(None)
-
-if __name__ == "__main__":
-    main()
