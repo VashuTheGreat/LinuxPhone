@@ -46,6 +46,7 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
         GLib.timeout_add(15000, self._auto_refresh_devices)
         GLib.idle_add(self._load_from_cache)
         self.calls.set_incoming_callback(self._show_incoming_call_popup)
+        self.calls.set_call_removed_callback(self._on_call_removed)
         # Battery: poll every 30 s
         self.battery.add_callback(self._on_battery_update, self._on_signal_update)
         GLib.timeout_add(30000, self._poll_battery)
@@ -979,6 +980,23 @@ class LinuxPhoneWindow(Adw.ApplicationWindow):
             try: self._ring_proc.terminate()
             except: pass
             self._ring_proc = None
+
+    def _on_call_removed(self, call_path):
+        """Called when a call is disconnected/hung up from the mobile side"""
+        # Stop ringtone
+        self._stop_ringtone()
+        # If it's the current incoming call, close the dialog
+        if getattr(self, '_incoming_call_path', None) == call_path:
+            if hasattr(self, '_incoming_dialog') and self._incoming_dialog:
+                try: self._incoming_dialog.close()
+                except: pass
+            self._incoming_dialog = None
+            self._incoming_call_path = None
+        # Also close in-call dialog if it was active
+        if hasattr(self, 'active_call_dialog') and self.active_call_dialog:
+            try: self.active_call_dialog.close()
+            except: pass
+            self.active_call_dialog = None
 
     def _show_incoming_call_popup(self, number, call_path):
         """Show a full-screen-style incoming call dialog with Answer/Reject"""

@@ -21,27 +21,41 @@ class CallManager:
         """cb(number, call_path) called when an incoming call arrives"""
         self._incoming_cb = cb
 
+    def set_call_removed_callback(self, cb):
+        """cb(call_path) called when a call is disconnected/removed"""
+        self._removed_cb = cb
+
     def _watch_calls(self):
-        """Subscribe to oFono VoiceCallManager.CallAdded signal on system bus"""
+        """Subscribe to oFono VoiceCallManager CallAdded and CallRemoved signals on system bus"""
         try:
             self._bus.add_signal_receiver(
                 self._on_call_added,
                 signal_name="CallAdded",
                 dbus_interface="org.ofono.VoiceCallManager",
-                bus_name="org.ofono",
-                path_keyword="sender_path"
+                bus_name="org.ofono"
+            )
+            self._bus.add_signal_receiver(
+                self._on_call_removed,
+                signal_name="CallRemoved",
+                dbus_interface="org.ofono.VoiceCallManager",
+                bus_name="org.ofono"
             )
         except Exception as e:
-            print(f"[CallManager] Could not subscribe to CallAdded: {e}")
+            print(f"[CallManager] Could not subscribe to Call signals: {e}")
 
-    def _on_call_added(self, call_path, props, sender_path=None):
+    def _on_call_added(self, call_path, props):
         """Fires when oFono announces a new call (incoming or outgoing)"""
         state = str(props.get("State", ""))
         line_id = str(props.get("LineIdentification", "Unknown"))
         name = str(props.get("Name", ""))
         display = name if name else line_id
-        if state == "incoming" and self._incoming_cb:
+        if state == "incoming" and getattr(self, '_incoming_cb', None):
             GLib.idle_add(self._incoming_cb, display, str(call_path))
+
+    def _on_call_removed(self, call_path):
+        """Fires when a call is destroyed/disconnected"""
+        if getattr(self, '_removed_cb', None):
+            GLib.idle_add(self._removed_cb, str(call_path))
 
     def answer(self, call_path):
         """Answer an incoming call by its oFono object path"""
