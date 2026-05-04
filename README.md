@@ -1,35 +1,6 @@
-<p align="center">
-  <img src="https://raw.githubusercontent.com/VashuTheGreat/LinuxPhone/main/dist/icons/icon.svg" width="100" alt="LinuxPhone Icon"/>
-</p>
+# 📱 LinuxPhone
 
-<h1 align="center">📱 LinuxPhone</h1>
-
-<p align="center">
-  <b>Linux ke liye native Bluetooth Phone Companion</b><br/>
-  Apne Android phone ke contacts, calls aur dial pad — seedha Linux desktop pe
-</p>
-
-<p align="center">
-  <img src="https://img.shields.io/badge/Platform-Linux-blue?logo=linux" />
-  <img src="https://img.shields.io/badge/Python-3.10%2B-green?logo=python" />
-  <img src="https://img.shields.io/badge/GTK-4.0%20%2F%20Adwaita-orange" />
-  <img src="https://img.shields.io/badge/Bluetooth-BlueZ%20%2B%20PBAP-informational" />
-  <img src="https://img.shields.io/badge/License-MIT-lightgrey" />
-</p>
-
----
-
-## ⚡ Install (One Command)
-
-```bash
-git clone https://github.com/VashuTheGreat/LinuxPhone.git && cd LinuxPhone && bash install.sh
-```
-
-> **Requirements:** Ubuntu / Debian based Linux, Bluetooth adapter
-
-Install hone ke baad:
-- Terminal se chalao: `linuxphone`
-- Ya app menu mein **"LinuxPhone"** search karo
+**Bluetooth Phone Companion for Linux** — GTK4/Adwaita desktop app that connects to your Android phone via Bluetooth and gives you Phone Link-style features natively on Linux.
 
 ---
 
@@ -37,88 +8,126 @@ Install hone ke baad:
 
 | Feature | Status |
 |---|---|
-| 📒 Contacts sync via Bluetooth (PBAP) | ✅ Working |
-| 📞 Recent calls — Incoming / Outgoing / Missed | ✅ Working |
-| 🔢 Dial Pad — number dial karo | ✅ Working |
-| 🔵 Bluetooth device connect / disconnect | ✅ Working |
-| 📦 Offline cache — bina Bluetooth ke bhi contacts dikhte hain | ✅ Working |
-| 🔍 Contact search | ✅ Working |
-| 📲 Call back button (call history se) | ✅ Working |
-| 📞 Make calls via HFP / oFono | ✅ Working (oFono required) |
-| 💬 SMS / Messages | 🔄 Planned |
+| 📞 Answer / reject incoming calls from PC | ✅ |
+| 🔔 Ringtone plays on PC when call comes in | ✅ |
+| ☎️ Make outgoing calls from PC | ✅ |
+| 👥 Contact sync (Bluetooth PBAP) | ✅ |
+| 📋 Recent call history — color-coded Incoming/Outgoing/Missed | ✅ |
+| 🎵 Media control: Play/Pause/Next/Prev (Bluetooth AVRCP) | ✅ |
+| 🔋 Battery level display (approximate, Bluetooth HFP) | ✅ |
+| 📶 Network carrier + signal | ✅ |
+| 💬 SMS receive (requires oFono MessageManager) | ✅ |
 
 ---
 
-## 🖥️ Screenshots
+## 📋 Requirements
 
-> _Coming soon_
-
----
-
-## 📋 How to Use
-
-### 1. Phone pair karo
-Pehle phone ko Linux ke saath Bluetooth se pair karo:
-```bash
-bluetoothctl
-> scan on
-> pair XX:XX:XX:XX:XX:XX
-> connect XX:XX:XX:XX:XX:XX
-```
-
-### 2. App kholo
-```bash
-linuxphone
-```
-
-### 3. Contacts sync karo
-- **Contacts** tab mein jao → **"Sync Contacts"** button dabao
-- Phone pe permission allow karo
-- Contacts load honge aur cache mein save ho jaayenge
-
-### 4. Call history dekho
-- **Recent Calls** tab mein jao → **"Sync Calls"** button dabao
-- **All / Incoming / Outgoing / Missed** filter se sort karo
-
-### 5. Call karo
-- Contacts mein phone icon dabao
-- Ya **Dial Pad** tab se number type karo
+- Linux with BlueZ Bluetooth stack
+- Python 3.10+
+- GTK4 + Libadwaita
+- oFono (for calls, battery, signal)
+- obexd / bluez-obexd (for contacts sync)
 
 ---
 
-## 📦 Dependencies
-
-`install.sh` automatically install kar deta hai:
-
-| Package | Kaam |
-|---|---|
-| `python3-gi`, `gir1.2-gtk-4.0` | GTK4 UI |
-| `gir1.2-adw-1` | Adwaita design |
-| `python3-dbus` | Bluetooth DBus interface |
-| `python3-vobject` | vCard / VCF parsing |
-| `bluez` | Bluetooth stack |
-| `ofono` | Calling support (HFP) — optional |
-
----
-
-## 🗂️ Cache
-
-Contacts aur calls `~/.cache/linuxphone/` mein JSON format mein save hote hain:
-```
-~/.cache/linuxphone/
-├── contacts.json   ← synced contacts
-└── calls.json      ← recent call history
-```
-Iska matlab: **phone connected na ho tab bhi** app contacts dikhayega.
-
----
-
-## 🔧 Manual Run (bina install ke)
+## 🚀 Installation
 
 ```bash
 git clone https://github.com/VashuTheGreat/LinuxPhone.git
 cd LinuxPhone
-python3 linuxphone_gui.py
+bash install.sh
+```
+
+The installer will:
+1. Check Python 3 and GTK4/Adwaita libraries
+2. Install missing `python3-gi`, `python3-dbus`, `python3-vobject` packages
+3. Check and guide you through bluez, obexd, oFono setup
+4. Install app to `~/.local/share/linuxphone/`
+5. Create a `linuxphone` launcher in `~/.local/bin/`
+6. Add a desktop entry (app menu shortcut)
+7. Optionally add `~/.local/bin` to your PATH
+
+After install:
+```bash
+linuxphone        # from terminal
+# OR search "LinuxPhone" in your app menu
+```
+
+---
+
+## 🔧 Manual Dependencies
+
+```bash
+# Ubuntu / Debian / Linux Mint
+sudo apt install \
+    python3-gi python3-gi-cairo \
+    gir1.2-gtk-4.0 gir1.2-adw-1 \
+    python3-dbus python3-vobject \
+    bluez bluez-obexd ofono \
+    pulseaudio-utils
+
+# Enable services
+sudo systemctl enable --now bluetooth ofono
+```
+
+---
+
+## 📱 First-Time Phone Setup
+
+1. **Pair your phone** with your PC first:
+   ```bash
+   bluetoothctl
+   > scan on
+   > pair XX:XX:XX:XX:XX:XX
+   > trust XX:XX:XX:XX:XX:XX
+   > connect XX:XX:XX:XX:XX:XX
+   ```
+
+2. **Accept permissions** on your phone when prompted:
+   - Allow contact sharing (for PBAP sync)
+   - Allow media info sharing (for AVRCP)
+
+3. **Keep phone screen unlocked** during first contact sync
+
+4. **oFono HFP profile** — phone must support Bluetooth HFP (Hands-Free Profile). All modern Android phones do.
+
+---
+
+## 🔋 Battery Note
+
+Battery is read via Bluetooth HFP `AT+CIEV` indicator which only provides a **0–5 coarse scale** (not exact %). Each step covers ~20% range:
+
+| HFP Level | Approximate Battery |
+|---|---|
+| 5 | 81–100% |
+| 4 | 61–80% |
+| 3 | 41–60% |
+| 2 | 21–40% |
+| 1 | 1–20% |
+| 0 | Critical |
+
+This is a Bluetooth protocol limitation — exact % is not available via standard HFP without a companion app (like Sefirah/KDE Connect).
+
+---
+
+## 🏗️ Project Structure
+
+```
+LinuxPhone/
+├── main.py                          # Entry point
+├── install.sh                       # Installer
+├── uninstall.sh                     # Uninstaller
+└── src/
+    ├── components/
+    │   ├── linuxphone_gui.py        # Main GTK4 window + UI
+    │   ├── bluetooth_manager.py     # BlueZ adapter management
+    │   ├── call_manager.py          # HFP calls via oFono
+    │   ├── pba_fetcher.py           # PBAP contacts + call history
+    │   ├── battery_monitor.py       # Battery + signal via oFono
+    │   ├── media_controller.py      # AVRCP media control
+    │   └── sms_manager.py           # SMS via oFono
+    └── constants/
+        └── __init__.py              # CSS + cache paths
 ```
 
 ---
@@ -131,27 +140,12 @@ bash uninstall.sh
 
 ---
 
-## 🛠️ Tech Stack
-
-- **Python 3** — core language
-- **GTK4 + Adwaita (libadwaita)** — modern GNOME UI
-- **BlueZ** — Linux Bluetooth stack
-- **PBAP (Phone Book Access Profile)** — contacts & call history fetch
-- **oFono + HFP** — voice calling
-- **DBus** — system service communication
-
----
-
-## 🤝 Contributing
-
-Pull requests welcome! Koi bug mile ya feature suggest karna ho to [Issues](https://github.com/VashuTheGreat/LinuxPhone/issues) mein batao.
-
----
-
 ## 📄 License
 
-MIT License — free to use, modify aur distribute karo.
+MIT License — see [LICENSE](LICENSE)
 
 ---
 
-<p align="center">Built with ❤️ for Linux users who want their phone on their desktop</p>
+## 🙏 Credits
+
+Inspired by [Sefirah](https://github.com/shrimqy/Sefirah) — a Windows Phone Link alternative.
