@@ -185,19 +185,15 @@ ok "Launcher created: $BIN_DIR/linuxphone"
 # ── Step 5: Desktop entry + icon ───────────────────────────────
 step "5/6" "Creating desktop entry and icon..."
 
-# SVG icon
+# SVG icon — original logo
 mkdir -p "$ICON_DIR"
 cat > "$ICON_DIR/${APP_ID}.svg" << 'SVG'
 <?xml version="1.0" encoding="UTF-8"?>
 <svg width="128" height="128" viewBox="0 0 128 128"
      xmlns="http://www.w3.org/2000/svg">
   <rect width="128" height="128" rx="28" fill="#3584e4"/>
-  <rect x="44" y="16" width="40" height="96" rx="8" fill="white" opacity="0.15"/>
-  <rect x="50" y="22" width="28" height="56" rx="4" fill="white" opacity="0.9"/>
-  <circle cx="64" cy="94" r="5" fill="white" opacity="0.8"/>
-  <!-- Phone handset icon -->
-  <path d="M52 36 Q52 28 60 28 L68 28 Q76 28 76 36 L76 92 Q76 100 68 100 L60 100 Q52 100 52 92 Z"
-        fill="none" stroke="white" stroke-width="0" opacity="0"/>
+  <text x="64" y="90" font-size="72" text-anchor="middle"
+        font-family="sans-serif">📱</text>
 </svg>
 SVG
 ok "Icon created"
